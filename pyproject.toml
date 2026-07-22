@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "e2e_optics"
+version = "0.1.0"
+description = "Modular PyTorch framework for GTRA-based end-to-end optics-algorithm co-design (Cote et al. 2026)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "e2e_optics contributors" }]
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pillow",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["e2e_optics*"]
