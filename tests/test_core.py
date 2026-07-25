@@ -218,6 +218,78 @@ def test_chromatic_spot_spread():
     assert max(cy) - min(cy) > 1e-3, cy
 
 
+# ---------------------------------------------------------------------------
+# Derived element apertures (Supp. S2.1: aperture specified by EPD/f-number,
+# element semi-diameters are never inputs)
+# ---------------------------------------------------------------------------
+def _toy_derived(rings=6, fields=(0.0, 15.0, 30.0)):
+    """Same toy, but with every semi_aperture left as None (derived)."""
+    s = [
+        Surface(1 / 5.0,   0.0, [0., 0., 0.], 2.2, 1.5, True),
+        Surface(-1 / 18.0, 0.0, [0., 0., 0.], 2.0, 1.0, False),
+        Surface(1 / 9.0,   0.0, [0., 0., 0.], 2.2, 1.5, False),
+        Surface(-1 / 9.0,  0.0, [0., 0., 0.], 2.1, 1.0, False),
+    ]
+    return RotationallySymmetricLens(s, epd=5.0, fields_deg=list(fields),
+                                     wavelengths_um=[0.5876], n_pupil_rings=rings,
+                                     variables=("curvature", "asph", "thickness"), dtype=DT)
+
+
+def test_derived_apertures_contain_all_rays():
+    """No traced ray may lie outside the element it refracts at."""
+    lens = _toy_derived()
+    sa = lens.semi_aperture
+    r = lens.ray_probes()["r"]                     # (S,F,W,P)
+    for si in range(lens.n_surfaces):
+        assert float(r[si].max()) <= sa[si] + 1e-12, (si, float(r[si].max()), sa[si])
+
+
+def test_derived_apertures_track_the_design():
+    """Hardcoded apertures go stale under optimization; derived ones cannot."""
+    lens = _toy_derived()
+    before = list(lens.semi_aperture)
+    th = lens.get_theta().clone()
+    th[-1] = th[-1] + 2.0                          # stretch a thickness
+    lens.set_theta(th)
+    after = list(lens.semi_aperture)
+    assert max(abs(a - b) for a, b in zip(after, before)) > 1e-3, (before, after)
+    # and containment still holds at the new design
+    r = lens.ray_probes()["r"]
+    for si in range(lens.n_surfaces):
+        assert float(r[si].max()) <= after[si] + 1e-12
+
+
+def test_declared_aperture_overrides_and_reports_overflow():
+    """An explicit semi_aperture is honoured and its overflow is reported."""
+    lens = _toy()                                  # the old hardcoded values
+    rows = lens.aperture_report()
+    assert [r["declared"] for r in rows] == [2.6, 2.8, 3.4, 3.8]
+    assert lens.semi_aperture == [2.6, 2.8, 3.4, 3.8]
+    # the front two surfaces are known to be undersized for a 30-deg field
+    assert rows[0]["overflow"] > 0.1 and rows[1]["overflow"] > 0.1
+    assert rows[2]["overflow"] == 0.0 and rows[3]["overflow"] == 0.0
+
+
+def test_probes_do_not_perturb_the_trace():
+    """probes=True must leave traced values and gradients bit-identical."""
+    lens = _toy_derived(rings=4)
+    packed = lens._pack()
+    xy0, v0 = lens._trace_packed(packed)
+    xy1, v1, pk = lens._trace_packed(packed, probes=True)
+    assert torch.equal(xy0, xy1) and torch.equal(v0, v1)
+    th_a = lens.get_theta().clone().requires_grad_(True)
+    g0 = torch.autograd.grad(lens.spot_from_theta(th_a).pow(2).sum(), th_a)[0]
+
+    def loss(t):
+        p = lens._pack().clone().to(t.dtype)
+        p[lens.var_mask] = t
+        return lens._trace_packed(p, probes=True)[0].reshape(-1).pow(2).sum()
+
+    th_b = lens.get_theta().clone().requires_grad_(True)
+    g1 = torch.autograd.grad(loss(th_b), th_b)[0]
+    assert torch.equal(g0, g1), (g0 - g1).abs().max()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

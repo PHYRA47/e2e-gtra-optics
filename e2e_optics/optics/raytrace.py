@@ -140,7 +140,13 @@ class Surface:
     n_after    : refractive index of the medium AFTER this surface, at the
                  d-line (n_d). Index BEFORE the first surface is air = 1.0.
     is_stop    : marks the aperture stop (metadata)
-    semi_aperture : clear semi-diameter (mm) for layout plots / vignetting
+    semi_aperture : clear semi-diameter (mm). Leave as None (default) to DERIVE
+                 it from the traced ray footprint -- the paper specifies aperture
+                 by EPD / f-number and never gives element semi-diameters as
+                 inputs (Supp. S2.1, Table S8). Set a float only to impose a
+                 mechanical override (a real barrel or a stop smaller than the
+                 light), which `aperture_report()` will then flag if the traced
+                 rays exceed it.
     abbe       : Abbe number v_d of the medium after this surface. Only used
                  when chromatic dispersion is enabled. 0.0 (default) means "no
                  dispersion data" -> that surface stays at its scalar n_after
@@ -154,7 +160,7 @@ class Surface:
     thickness: float = 1.0
     n_after: float = 1.0
     is_stop: bool = False
-    semi_aperture: float = 5.0
+    semi_aperture: Optional[float] = None
     abbe: float = 0.0
     dpgf: float = 0.0
 
@@ -243,7 +249,14 @@ class RotationallySymmetricLens(BaseOptics):
         self.register_buffer("asph", asph)
         self.register_buffer("thick", thick)
         self.register_buffer("n_after", n_after)
-        self.semi_aperture = [s.semi_aperture for s in surfaces]
+        # Aperture is specified by the EPD (above); element semi-diameters are
+        # DERIVED from the ray footprint unless explicitly overridden. Keep the
+        # declared values (possibly all None) so `effective_semi_apertures()` can
+        # honour real mechanical limits while `aperture_report()` flags overflow.
+        self._semi_aperture_declared = (
+            None if all(s.semi_aperture is None for s in surfaces)
+            else [s.semi_aperture for s in surfaces])
+        self._sa_cache = None
         self.is_stop = [s.is_stop for s in surfaces]
 
         # --- per-surface x per-wavelength index table (S, W) -----------------
@@ -316,10 +329,26 @@ class RotationallySymmetricLens(BaseOptics):
             self.asph.copy_(asph); self.thick.copy_(thick)
 
     # ---- the trace -------------------------------------------------------
-    def _trace_packed(self, packed: torch.Tensor):
+    def _trace_packed(self, packed: torch.Tensor, probes: bool = False):
         """Core trace as a pure function of the packed parameter vector.
 
         Returns xy (F, W, P, 2) and valid (F, W, P).
+
+        With ``probes=True`` a third value is returned: a dict of intermediate
+        per-ray geometry, following the paper's "rays as probes" idea (Supp.
+        S2.2.2) where quantities collected during the spot-diagram trace are
+        reused to derive element apertures and geometric constraints:
+
+          ``r``   (S, F, W, P)   radial height |(x,y)| at each surface
+          ``tz``  (S, F, W, P)   axial marching distance into each spacing
+          ``ci``  (S, F, W, P)   cos^2 of the angle of incidence
+          ``cr``  (S, F, W, P)   cos^2 of the angle of refraction
+
+        Negative ``ci``/``cr`` flag a missed surface and total internal
+        reflection respectively. Everything stays attached to the autograd graph,
+        so residuals built from these probes are differentiable w.r.t. theta.
+        Default ``probes=False`` leaves the traced values and their gradients
+        bit-identical to the plain trace.
         """
         curv, conic, asph, thick = self._unpack(packed)
         dtype = packed.dtype
@@ -345,6 +374,7 @@ class RotationallySymmetricLens(BaseOptics):
         d[..., 2] = torch.cos(u).reshape(F, 1, 1)
 
         valid = torch.ones(F, W, P, dtype=torch.bool)
+        pr_r, pr_tz, pr_ci, pr_cr, pr_reach = [], [], [], [], []
 
         n_before = torch.ones(W, dtype=dtype)              # air before first surface
         for si in range(self.n_surfaces):
@@ -364,6 +394,14 @@ class RotationallySymmetricLens(BaseOptics):
                 fp = dz - dsag_du * drho2_dt
                 t = t - f / fp
             x = x0 + t * dx; y = y0 + t * dy; z = z0 + t * dz
+            if probes:
+                # radial height at this surface and the axial distance travelled
+                # through the spacing that ENDS here (Supp. S2.2.2 uses t_z).
+                pr_r.append(torch.sqrt((x * x + y * y).clamp_min(0.0) + 1e-30))
+                pr_tz.append(z - z0)
+                # conic reachability: the sag square-root argument. Negative =>
+                # the surface does not extend to this radius, i.e. the ray misses.
+                pr_reach.append(1.0 - (1.0 + k) * c * c * (x * x + y * y))
             pos = torch.stack([x, y, z], -1)
             valid = valid & torch.isfinite(t) & (t > -1e3)
 
@@ -381,6 +419,14 @@ class RotationallySymmetricLens(BaseOptics):
             # the scalar n_after, so this reduces to the monochromatic trace.
             n_aft = self.n_after_w[si].to(dtype)            # (W,)
             mu_w = (n_before / n_aft).reshape(1, W, 1)      # (1,W,1)
+            if probes:
+                # zeta_I = cos^2(theta), zeta_R = cos^2(theta') of Supp. S2.2.2.
+                # zeta_R < 0 is exactly the total-internal-reflection signal;
+                # both are smooth in theta, unlike the boolean masks.
+                ci2 = ((d * nrm).sum(-1)) ** 2
+                sin2_t = (mu_w.squeeze(-1) ** 2) * (1.0 - ci2)
+                pr_ci.append(ci2)
+                pr_cr.append(1.0 - sin2_t)
             d, ok = refract(d, nrm, mu_w)
             valid = valid & ok
             n_before = n_aft
@@ -401,6 +447,14 @@ class RotationallySymmetricLens(BaseOptics):
         valid = valid & (~far)
         # sanitize failed rays so the LM Jacobian stays finite; mask handles PSF
         xy = torch.nan_to_num(xy, nan=0.0, posinf=0.0, neginf=0.0)
+        if probes:
+            # the last spacing (rear element -> image plane) is the image
+            # clearance that Supp. S2.2.2 constrains alongside the glass/air gaps
+            pr_tz.append(z_img - z0)
+            pk = {"r": torch.stack(pr_r), "tz": torch.stack(pr_tz),
+                  "ci": torch.stack(pr_ci), "cr": torch.stack(pr_cr),
+                  "reach": torch.stack(pr_reach), "valid": valid}
+            return xy, valid, pk
         return xy, valid
 
     def spot_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
@@ -433,6 +487,87 @@ class RotationallySymmetricLens(BaseOptics):
             _, valid = self._trace_packed(self._pack())
         return SpotDiagram(xy=xy, valid=valid,
                            fields_deg=self.fields_deg, wavelengths_um=self.wavelengths_um)
+
+    # ---- apertures: specified by EPD, DERIVED per element ------------------
+    @property
+    def semi_aperture(self):
+        """Per-surface clear semi-diameter (mm) actually in force.
+
+        Derived from the ray footprint by default, so it tracks the design as the
+        optimizer moves it; a declared value overrides its surface. Cached per
+        parameter state so repeated layout calls do not re-trace.
+        """
+        key = None
+        if self._semi_aperture_declared is None or any(
+                v is None for v in self._semi_aperture_declared):
+            key = float(self._pack().sum())          # cheap design fingerprint
+            if self._sa_cache is not None and self._sa_cache[0] == key:
+                return self._sa_cache[1]
+        vals = [float(v) for v in self.effective_semi_apertures()]
+        if key is not None:
+            self._sa_cache = (key, vals)
+        return vals
+
+    def ray_probes(self):
+        """Per-ray geometric probes for the current design (see _trace_packed)."""
+        _, _, pk = self._trace_packed(self._pack(), probes=True)
+        return pk
+
+    def clear_semi_apertures(self, margin: float = 1.05) -> torch.Tensor:
+        """Clear semi-diameter (mm) of each element, DERIVED from the ray trace.
+
+        The paper specifies the aperture of a system by its entrance pupil
+        diameter or f-number (Supp. S2.1, Table S8) -- element semi-diameters are
+        never given as inputs; they follow from the light the system actually
+        carries. So we take the largest ray radius reaching each surface over the
+        full field x wavelength x pupil grid and scale it by ``margin``.
+
+        This matters during optimization: with thickness (or curvature) free, the
+        off-axis beam walks up and down the rear elements, so any hand-declared
+        semi-diameter goes stale and the layout draws rays passing outside the
+        glass they refract at. A derived aperture cannot go stale.
+
+        Returns a detached (S,) tensor -- geometry for drawing and reporting, not
+        an optimization variable.
+        """
+        r = self.ray_probes()["r"]                      # (S,F,W,P)
+        v = self.ray_probes()["valid"]                  # (F,W,P)
+        r = torch.where(v.unsqueeze(0), r, torch.zeros_like(r))
+        return (r.reshape(self.n_surfaces, -1).max(dim=1).values * float(margin)).detach()
+
+    def effective_semi_apertures(self, margin: float = 1.05) -> torch.Tensor:
+        """Semi-apertures used for drawing: the declared override where the user
+        gave one, else the derived value."""
+        der = self.clear_semi_apertures(margin)
+        if self._semi_aperture_declared is None:
+            return der
+        out = der.clone()
+        for si, v in enumerate(self._semi_aperture_declared):
+            if v is not None:
+                out[si] = float(v)
+        return out
+
+    def aperture_report(self, margin: float = 1.05):
+        """Per-surface table of declared vs required clear semi-diameter.
+
+        Returns a list of dicts with keys ``surface``, ``declared`` (None if the
+        aperture is derived), ``required`` (max traced ray radius, mm),
+        ``recommended`` (required x margin) and ``overflow`` (mm by which the
+        traced light exceeds the declared value; > 0 means rays pass outside the
+        element -- the defect this replaces).
+        """
+        req = (self.clear_semi_apertures(1.0)).tolist()
+        rows = []
+        for si in range(self.n_surfaces):
+            dec = (None if self._semi_aperture_declared is None
+                   else self._semi_aperture_declared[si])
+            rows.append({"surface": si,
+                         "declared": None if dec is None else float(dec),
+                         "required": float(req[si]),
+                         "recommended": float(req[si]) * float(margin),
+                         "overflow": (0.0 if dec is None
+                                      else max(0.0, float(req[si]) - float(dec)))})
+        return rows
 
     # ---- extension hook --------------------------------------------------
     def aim_rays(self, *a, **k):
