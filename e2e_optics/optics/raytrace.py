@@ -95,12 +95,15 @@ def refract(d: torch.Tensor, n: torch.Tensor, mu: torch.Tensor):
 
     Returns (d_out, ok) where ok is False for total internal reflection.
     Normals are flipped per-ray so the incidence cosine is positive.
-    Shapes: d,n : (..., 3); mu : scalar or (...,).
+    Shapes: d,n : (..., 3); mu : scalar or a tensor broadcastable to the
+    batch dims of ``d`` (e.g. ``(1, W, 1)`` for a per-wavelength ratio). The
+    trailing vector axis is added here, so the wavelength axis is preserved
+    rather than collapsed to a scalar.
     """
     cos_i = -(d * n).sum(-1, keepdim=True)
     n = torch.where(cos_i < 0, -n, n)        # ensure normal opposes incidence
     cos_i = cos_i.abs()
-    mu_ = mu.reshape(*([1] * (d.dim() - 1)), 1) if torch.is_tensor(mu) else mu
+    mu_ = mu[..., None] if torch.is_tensor(mu) else mu
     sin2_t = (mu_ * mu_) * (1.0 - cos_i * cos_i)      # Eq. S13 rearranged
     ok = (sin2_t <= 1.0).squeeze(-1)
     cos_t = torch.sqrt(torch.clamp(1.0 - sin2_t, min=0.0))
@@ -134,10 +137,16 @@ class Surface:
     asph       : aspheric coefficients [a2, a3, ...] (powers r^4, r^6, ...)
     thickness  : axial distance (mm) from this surface's vertex to the next
                  (or to the image plane, for the last surface)
-    n_after    : refractive index of the medium AFTER this surface
-                 (index BEFORE the first surface is air = 1.0)
+    n_after    : refractive index of the medium AFTER this surface, at the
+                 d-line (n_d). Index BEFORE the first surface is air = 1.0.
     is_stop    : marks the aperture stop (metadata)
     semi_aperture : clear semi-diameter (mm) for layout plots / vignetting
+    abbe       : Abbe number v_d of the medium after this surface. Only used
+                 when chromatic dispersion is enabled. 0.0 (default) means "no
+                 dispersion data" -> that surface stays at its scalar n_after
+                 for every wavelength (e.g. air, or a monochromatic glass).
+    dpgf       : partial-dispersion deviation dP_g,F (default 0.0 = normal
+                 glass line); refines the Hartmann fit for special glasses.
     """
     curvature: float = 0.0
     conic: float = 0.0
@@ -146,6 +155,8 @@ class Surface:
     n_after: float = 1.0
     is_stop: bool = False
     semi_aperture: float = 5.0
+    abbe: float = 0.0
+    dpgf: float = 0.0
 
 
 # ----------------------------------------------------------------------------
@@ -186,6 +197,7 @@ class RotationallySymmetricLens(BaseOptics):
                  variables: Optional[Sequence[str]] = None,
                  newton_iters: int = 12,
                  pupil_jitter: bool = True,
+                 dispersion: bool = True,
                  dtype: torch.dtype = torch.float64,
                  seed: int = 0):
         """
@@ -199,6 +211,11 @@ class RotationallySymmetricLens(BaseOptics):
                         all-but-the-image gap are made variable per selection.
                         Default: curvature + asph + thickness (matches the toy).
         newton_iters  : Newton iterations for aspheric ray-marching
+        dispersion    : if True (default), glass surfaces carrying Abbe data are
+                        traced with a per-wavelength Hartmann index, so multiple
+                        wavelengths show chromatic aberration. If False, every
+                        wavelength uses the scalar d-line n_after (monochromatic
+                        -- reproduces the pre-dispersion behavior bit-for-bit).
         dtype         : float64 recommended for LM conditioning
         """
         super().__init__()
@@ -228,6 +245,25 @@ class RotationallySymmetricLens(BaseOptics):
         self.register_buffer("n_after", n_after)
         self.semi_aperture = [s.semi_aperture for s in surfaces]
         self.is_stop = [s.is_stop for s in surfaces]
+
+        # --- per-surface x per-wavelength index table (S, W) -----------------
+        # Glass indices are FIXED (not optimization variables), so this table is
+        # precomputed once and never enters the autodiff Jacobian. For a glass
+        # surface with Abbe data and dispersion enabled, each wavelength gets its
+        # own Hartmann index n(lambda); otherwise the scalar n_after is broadcast
+        # across all wavelengths (the monochromatic path).
+        self.dispersion = bool(dispersion)
+        self.abbe = [float(s.abbe) for s in surfaces]
+        self.dpgf = [float(s.dpgf) for s in surfaces]
+        W = self.wavelengths_um.numel()
+        n_tab = n_after.reshape(S, 1).repeat(1, W).clone()          # (S, W)
+        if self.dispersion:
+            for si, s in enumerate(surfaces):
+                if s.n_after > 1.0 and s.abbe > 0.0:                 # a glass with data
+                    for wi, wl in enumerate(self.wavelengths_um.tolist()):
+                        n_tab[si, wi] = hartmann_index(s.n_after, s.abbe,
+                                                       float(wl), s.dpgf)
+        self.register_buffer("n_after_w", n_tab)
 
         # --- build the variable mask over [curv | conic | asph | thick] ------
         if variables is None:
@@ -340,8 +376,10 @@ class RotationallySymmetricLens(BaseOptics):
             nrm = nrm / nrm.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
             # ---- refraction: mu = n_before / n_after (per wavelength) ----
-            n_aft = self.n_after[si] * torch.ones(W, dtype=dtype) if self.n_after.dim() == 1 else self.n_after[si]
-            # dispersion extension point: replace n_aft with hartmann_index(...) per wavelength
+            # n_after_w is (S, W): the precomputed per-wavelength index. With
+            # dispersion off (or air / no-Abbe surfaces) every wavelength shares
+            # the scalar n_after, so this reduces to the monochromatic trace.
+            n_aft = self.n_after_w[si].to(dtype)            # (W,)
             mu_w = (n_before / n_aft).reshape(1, W, 1)      # (1,W,1)
             d, ok = refract(d, nrm, mu_w)
             valid = valid & ok
@@ -418,27 +456,40 @@ class RotationallySymmetricLens(BaseOptics):
         return r.detach(), (z + z_vert[si]).detach()
 
     def ray_paths(self, field_index: int = 0, wavelength_index: int = 0,
-                  n_fan: int = 9):
+                  n_fan: int = 9, pupil_radius: Optional[float] = None):
         """Meridional ray-fan polylines for a layout plot, in mm.
 
         Traces ``n_fan`` rays evenly across the pupil (y only, the meridional
         plane) for one field and wavelength, recording each ray's (z, y) vertex
         at every surface and at the image plane.
 
+        ``pupil_radius`` sets the half-height of the launched fan (mm). Defaults
+        to the entrance-pupil radius ``0.5 * epd``; pass a smaller value (e.g.
+        the limiting clear semi-aperture) to keep the fan inside the glass for a
+        clean layout drawing.
+
+        ``wavelength_index`` selects which traced wavelength's index to use, so
+        chromatic fans bend by the correct per-colour index.
+
         Returns
         -------
-        z_nodes : (S+2,) tensor -- z of pupil, each surface vertex, image plane.
-        ys      : (n_fan, S+2) tensor -- y of each ray at those z planes.
+        zs : (n_fan, S+2) tensor -- z of each ray at the pupil, at its true
+             intersection on every surface, and at the image plane. Each ray
+             carries its OWN z per surface (a marginal ray meets a curved
+             surface at a different z than the chief ray), so plotting (zs, ys)
+             row-by-row puts every bend exactly on the drawn surface curve.
+        ys : (n_fan, S+2) tensor -- y of each ray at those same nodes.
 
         Purely for visualization (detached); does not touch the autodiff path.
         """
         with torch.no_grad():
             dtype = self.dtype
             S = self.n_surfaces
+            wi = int(wavelength_index)
             z_vert = torch.cat([torch.zeros(1, dtype=dtype),
                                 torch.cumsum(self.thick, 0)])       # (S+1,)
             z_img = z_vert[-1]
-            rp = 0.5 * self.epd
+            rp = 0.5 * self.epd if pupil_radius is None else float(pupil_radius)
             # meridional fan across the pupil (y in [-rp, rp], x = 0)
             py = torch.linspace(-rp, rp, n_fan, dtype=dtype)
             pos = torch.zeros(n_fan, 3, dtype=dtype)
@@ -447,7 +498,7 @@ class RotationallySymmetricLens(BaseOptics):
             d = torch.zeros(n_fan, 3, dtype=dtype)
             d[:, 1] = torch.sin(u); d[:, 2] = torch.cos(u)
 
-            nodes_z = [torch.zeros(1, dtype=dtype).expand(n_fan)]
+            nodes_z = [torch.zeros(n_fan, dtype=dtype)]   # pupil plane, per ray
             nodes_y = [pos[:, 1].clone()]
 
             n_before = torch.ones(1, dtype=dtype)
@@ -466,20 +517,22 @@ class RotationallySymmetricLens(BaseOptics):
                     t = t - f / fp
                 x = x0 + t * dx; y = y0 + t * dy; z = z0 + t * dz
                 pos = torch.stack([x, y, z], -1)
-                nodes_z.append(z.clone()); nodes_y.append(y.clone())
+                nodes_z.append(z.clone())        # per-ray true intersection z
+                nodes_y.append(y.clone())
                 uu = x * x + y * y
                 dsag = asphere_dsag_du(uu, c, k, a)
                 nrm = torch.stack([-2.0 * x * dsag, -2.0 * y * dsag,
                                    torch.ones_like(x)], -1)
                 nrm = nrm / nrm.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-                mu = (n_before / self.n_after[si]).reshape(1)
+                mu = (n_before / self.n_after_w[si, wi]).reshape(1)
                 d, _ = refract(d, nrm, mu)
-                n_before = self.n_after[si]
+                n_before = self.n_after_w[si, wi].reshape(1)
             # march to image plane
             t = (z_img - pos[:, 2]) / d[:, 2]
             y_img = pos[:, 1] + t * d[:, 1]
-            nodes_z.append(z_img.expand(n_fan)); nodes_y.append(y_img)
+            nodes_z.append(z_img.expand(n_fan).clone())
+            nodes_y.append(y_img)
 
-            z_nodes = torch.stack([zz.mean() for zz in nodes_z])     # (S+2,)
+            zs = torch.stack(nodes_z, dim=1)                         # (n_fan, S+2)
             ys = torch.stack(nodes_y, dim=1)                         # (n_fan, S+2)
-        return z_nodes.detach(), ys.detach()
+        return zs.detach(), ys.detach()

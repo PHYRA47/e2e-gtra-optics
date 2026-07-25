@@ -153,6 +153,71 @@ def test_toy_spot_shrinks_under_lm():
     assert esr1 < 0.25 * esr0, (esr0, esr1)
 
 
+def _toy_dispersive(dispersion=True, wavelengths=(0.4861, 0.5876, 0.6563),
+                    rings=6):
+    """Toy lens with N-BK7 Abbe data on the two glass elements."""
+    NBK7, VBK7 = 1.5168, 64.17
+    s = [
+        Surface(1 / 5.0,   0.0, [0., 0., 0.], 2.2, NBK7, True,  2.6, VBK7),
+        Surface(-1 / 18.0, 0.0, [0., 0., 0.], 2.0, 1.0,  False, 2.8),
+        Surface(1 / 9.0,   0.0, [0., 0., 0.], 2.2, NBK7, False, 3.4, VBK7),
+        Surface(-1 / 9.0,  0.0, [0., 0., 0.], 2.1, 1.0,  False, 3.8),
+    ]
+    return RotationallySymmetricLens(s, epd=5.0, fields_deg=(0.0, 15.0, 30.0),
+                                     wavelengths_um=wavelengths, n_pupil_rings=rings,
+                                     dispersion=dispersion, dtype=DT)
+
+
+def test_hartmann_index_matches_nbk7():
+    """The Hartmann model reproduces catalogue N-BK7 indices at F/d/C."""
+    from e2e_optics.optics.raytrace import hartmann_index
+    nF = hartmann_index(1.5168, 64.17, 0.4861)
+    nd = hartmann_index(1.5168, 64.17, 0.5876)
+    nC = hartmann_index(1.5168, 64.17, 0.6563)
+    assert abs(nd - 1.5168) < 1e-4, nd
+    assert abs(nF - 1.52238) < 1e-3, nF
+    assert abs(nC - 1.51432) < 1e-3, nC
+    assert nF > nd > nC                       # normal dispersion
+
+
+def test_dispersion_off_is_monochromatic():
+    """dispersion=False makes every wavelength trace the scalar d-line index."""
+    lens = _toy_dispersive(dispersion=False)
+    # all wavelengths share n_after -> identical spots per wavelength
+    xy = lens.forward().xy                    # (F, W, P, 2)
+    for wi in range(1, xy.shape[1]):
+        assert torch.allclose(xy[:, 0], xy[:, wi], atol=1e-9), wi
+
+
+def test_dispersion_dline_matches_scalar():
+    """With dispersion on, the d-line result is bit-for-bit the scalar trace.
+
+    The Hartmann model returns exactly n_d at the d-line by construction, so a
+    single-wavelength trace at 0.5876 um and the d-line slice of a multi-colour
+    trace must agree to machine precision (same glass, same pupil sampling).
+    """
+    scalar = _toy_dispersive(dispersion=True, wavelengths=(0.5876,))   # W=1 d-line
+    chrom = _toy_dispersive(dispersion=True)                           # F/d/C
+    xy_s = scalar.forward().xy[:, 0]
+    xy_d = chrom.forward().xy[:, 1]                                    # d is index 1
+    assert torch.allclose(xy_s, xy_d, atol=1e-12), (xy_s - xy_d).abs().max()
+
+
+def test_chromatic_spot_spread():
+    """Multiple wavelengths through real glass produce measurable colour."""
+    lens = _toy_dispersive(dispersion=True)
+    xy = lens.forward().xy                                        # (F, W, P, 2)
+    # axial colour: on-axis RMS differs across wavelengths
+    rms = []
+    for wi in range(xy.shape[1]):
+        c = xy[0, wi].mean(0)
+        rms.append(((xy[0, wi] - c) ** 2).sum(-1).sqrt().mean().item())
+    assert max(rms) - min(rms) > 1e-3, rms                       # mm-scale spread
+    # lateral colour: 30-deg centroid shifts with wavelength
+    cy = [xy[2, wi].mean(0)[1].item() for wi in range(xy.shape[1])]
+    assert max(cy) - min(cy) > 1e-3, cy
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

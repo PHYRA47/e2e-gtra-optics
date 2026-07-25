@@ -30,19 +30,31 @@ each independently.
 **Paper-style before/after** — a 2-element toy lens optimized by GTRA-LM, then a
 network trained to restore its blur:
 
-![before/after lens comparison](docs/figures/fig_viz_compare.png)
+![before/after lens comparison]({{artifact:art_3acfc155-0deb-4374-83cc-709f1f1de424}})
 
 **Progressive spot evolution** — the spot shrinking across LM iterations (367 µm → 21 µm):
 
-![spot evolution](docs/figures/fig_viz_evolution.png)
+![spot evolution]({{artifact:art_788680b6-64b8-4529-8def-a8377d9f28c4}})
 
 **End-to-end toy result** — blurred capture 15.3 dB → network-restored 35.3 dB:
 
-![restoration triptych](docs/figures/fig_demo_restoration.png)
+![restoration triptych]({{artifact:art_f8761b01-9193-4c62-9783-8100f4249f20}})
+
+**Chromatic ray tracing (optional)** — the tracer carries a paper-validated
+Hartmann dispersion model that can be toggled on. On-axis F/d/C rays show textbook
+axial color (486 nm focuses shortest, 656 nm longest); the zoom inset makes the
+sub-pixel crossover visible:
+
+![chromatic layout with focus zoom]({{artifact:art_c659708a-5275-4be7-aaa7-16517625ff7f}})
 
 More diagnostics (lens layout, spot diagrams, differentiable KDE PSF, convergence
 curves, animated evolution) are in [`docs/figures/`](docs/figures/), all generated
-by the reusable `e2e_optics.viz` module.
+by the reusable `e2e_optics.viz` module. Every shipped figure is reproducible in
+one command:
+
+```bash
+python scripts/make_figures.py          # regenerates everything in docs/figures/
+```
 
 ---
 
@@ -167,8 +179,30 @@ script cells:
   `callback`), then `plot_spot_evolution` for a grid or `animate_spot_evolution`
   for a GIF of the spot shrinking across iterations.
 
-All layout plots are backed by `RotationallySymmetricLens.ray_paths()`, which
-traces meridional ray fans through the system for the cross-section.
+Layout plots draw each refractive element as a **closed, filled glass body**
+(front and back surfaces joined at a ground rim), not a bare curvature line, and
+the meridional ray fans are launched across the **limiting clear aperture** so
+they stay inside the glass. Glass elements are detected automatically from the
+per-surface `n_after` (a gap with index > 1 is glass); rays come from
+`RotationallySymmetricLens.ray_paths(..., pupil_radius=...)`.
+
+**Consistent, customizable colour scheme.** Every figure shares one `VizStyle`,
+covering the four groups you can control — **surfaces**, **field lines**,
+**window / background**, and **font**:
+
+```python
+from e2e_optics import viz
+
+# option A: change the global default (affects every figure)
+viz.DEFAULT_STYLE.glass_facecolor = '#cfe8ff'
+viz.DEFAULT_STYLE.field_colors   = ['crimson', 'navy', 'seagreen']
+
+# option B: a one-off scheme passed to any plot via style=
+dark = viz.VizStyle(window_facecolor='#12151c', figure_facecolor='#12151c',
+                    font_color='#e8e8e8', glass_facecolor='#3a5f8a',
+                    field_colors=['#ffd166', '#ef476f', '#06d6a0'])
+viz.plot_lens_layout(lens, style=dark)
+```
 
 ```python
 from e2e_optics import viz, OptimizationRecorder
@@ -212,9 +246,13 @@ IRM — all present as documented stubs).
 
 ## Scope of v1
 
-This is the **minimal runnable slice**: monochromatic, front-stop, shift-invariant
-convolution, single scene in the demo, small network. The physics the paper
-validates against CODE V (dispersion, vignetting/ray-aiming, diffraction-compensated
+This is the **minimal runnable slice**: front-stop, shift-invariant
+convolution, single scene in the demo, small network. Chromatic **dispersion is
+implemented** and toggleable — pass `dispersion=True` to the lens with per-surface
+Abbe data and it traces each wavelength through the paper-validated Hartmann index
+model; the end-to-end demo stays monochromatic (the paper's Fig. 4 setup) but the
+tracer and layout viz fully support the F/d/C triplet. The remaining physics the
+paper validates against CODE V (vignetting/ray-aiming, diffraction-compensated
 PSF, overlap-add SV convolution, the full NAFNet+Wiener restorer) is present as
 **documented extension hooks** — clearly marked `NotImplementedError` stubs with
 the relevant supplementary-section references — so the framework is honest about
