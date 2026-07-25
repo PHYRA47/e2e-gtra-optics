@@ -343,6 +343,7 @@ class RotationallySymmetricLens(BaseOptics):
           ``tz``  (S, F, W, P)   axial marching distance into each spacing
           ``ci``  (S, F, W, P)   cos^2 of the angle of incidence
           ``cr``  (S, F, W, P)   cos^2 of the angle of refraction
+          ``sn``  (S, F, W, P)   cos^2 of the surface-normal-to-axis angle
 
         Negative ``ci``/``cr`` flag a missed surface and total internal
         reflection respectively. Everything stays attached to the autograd graph,
@@ -374,7 +375,7 @@ class RotationallySymmetricLens(BaseOptics):
         d[..., 2] = torch.cos(u).reshape(F, 1, 1)
 
         valid = torch.ones(F, W, P, dtype=torch.bool)
-        pr_r, pr_tz, pr_ci, pr_cr, pr_reach = [], [], [], [], []
+        pr_r, pr_tz, pr_ci, pr_cr, pr_reach, pr_sn = [], [], [], [], [], []
 
         n_before = torch.ones(W, dtype=dtype)              # air before first surface
         for si in range(self.n_surfaces):
@@ -427,6 +428,10 @@ class RotationallySymmetricLens(BaseOptics):
                 sin2_t = (mu_w.squeeze(-1) ** 2) * (1.0 - ci2)
                 pr_ci.append(ci2)
                 pr_cr.append(1.0 - sin2_t)
+                # zeta_SN = cos^2 of the angle between the surface normal and the
+                # optical axis (Supp. S2.2.2, Eq. S46) -- a manufacturability
+                # measure of how steep the surface gets at this ray's radius.
+                pr_sn.append(nrm[..., 2] ** 2)
             d, ok = refract(d, nrm, mu_w)
             valid = valid & ok
             n_before = n_aft
@@ -453,7 +458,8 @@ class RotationallySymmetricLens(BaseOptics):
             pr_tz.append(z_img - z0)
             pk = {"r": torch.stack(pr_r), "tz": torch.stack(pr_tz),
                   "ci": torch.stack(pr_ci), "cr": torch.stack(pr_cr),
-                  "reach": torch.stack(pr_reach), "valid": valid}
+                  "reach": torch.stack(pr_reach), "sn": torch.stack(pr_sn),
+                  "valid": valid}
             return xy, valid, pk
         return xy, valid
 

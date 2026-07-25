@@ -290,6 +290,123 @@ def test_probes_do_not_perturb_the_trace():
     assert torch.equal(g0, g1), (g0 - g1).abs().max()
 
 
+# ---------------------------------------------------------------------------
+# Soft geometric constraints as LM residuals (Supp. S2.2.2, Eq. S41-S47)
+# ---------------------------------------------------------------------------
+from e2e_optics.optimizer import constraints as _C
+
+
+def test_ramp_is_one_sided():
+    x = torch.tensor([-2.0, -1e-9, 0.0, 1e-9, 3.0], dtype=DT)
+    r = _C.ramp(x)
+    assert torch.all(r[:3] == 0) and r[3] > 0 and r[4] == 3.0
+    # satisfied constraints must contribute no gradient either
+    x = torch.tensor([-1.0], dtype=DT, requires_grad=True)
+    g = torch.autograd.grad(_C.ramp(x).sum(), x, allow_unused=True)[0]
+    assert g is None or float(g) == 0.0
+
+
+def test_satisfied_constraints_are_exactly_zero():
+    """A design inside every bound must produce an all-zero residual block."""
+    lens = _toy_derived(rings=4)
+    pk = lens.ray_probes()
+    # bounds so loose that nothing can violate them
+    r = _C.geometric_residuals(pk, tz_min=-1e3, tz_max=1e3,
+                               theta_max_deg=89.999, normal_max_deg=89.999)
+    assert r.numel() > 0 and float(r.abs().max()) == 0.0
+
+
+def test_spacing_kinds_read_off_the_optics():
+    """tz has one more entry than surfaces: pupil hop, spacings, image gap."""
+    lens = _toy_derived(rings=4)
+    kinds = _C.spacing_kinds_from_optics(lens)
+    assert len(kinds) == lens.ray_probes()["tz"].shape[0]
+    assert kinds[0] == "air" and kinds[-1] == "image"
+    # the toy is glass / air / glass / air: spacings after surfaces 0 and 2 are glass
+    assert kinds[1] == "glass" and kinds[2] == "air" and kinds[3] == "glass"
+
+
+def test_ray_path_residual_activates_on_violation():
+    """Collapsing an element thickness must raise l_RP above zero."""
+    lens = _toy_derived(rings=4)
+    gc = _C.GeometricConstraints.from_optics(lens, min_glass=0.25, min_air=0.1)
+    assert float(_C.ray_path_residuals(lens.ray_probes(), gc.tz_min, gc.tz_max).max()) \
+        < 0.05, "start design should be near-compliant"
+    th = lens.get_theta().clone()
+    idx = torch.nonzero(lens.var_mask).squeeze(-1).tolist()
+    t0 = lens.n_surfaces * (2 + lens.max_asph)          # thickness block offset
+    slots = [i for i, g in enumerate(idx) if g >= t0]
+    th[slots[0]] = 0.05                                  # 2.2 mm -> 0.05 mm
+    lens.set_theta(th)
+    bad = _C.ray_path_residuals(lens.ray_probes(), gc.tz_min, gc.tz_max)
+    assert float(bad.max()) > 0.0 and int((bad > 0).sum()) > 0
+
+
+def test_geometric_residuals_are_differentiable():
+    """The constraint block must give usable gradients w.r.t. theta."""
+    lens = _toy_derived(rings=4)
+    gc = _C.GeometricConstraints.from_optics(lens, min_glass=2.5)   # deliberately tight
+    th = lens.get_theta().clone().requires_grad_(True)
+
+    def f(t):
+        p = lens._pack().clone().to(t.dtype)
+        p[lens.var_mask] = t
+        return gc(lens._trace_packed(p, probes=True)[2]).pow(2).sum()
+
+    val = f(th)
+    assert float(val) > 0.0, "tight bound should be violated"
+    g = torch.autograd.grad(val, th)[0]
+    assert torch.isfinite(g).all() and float(g.abs().max()) > 0.0
+
+
+def test_constraints_rescue_a_violating_design():
+    """LM with l_RP recovers a collapsed thickness; without it the design fails.
+
+    This is the whole point of soft residuals: the TRA-only run drives the merit
+    to ~0 by producing a degenerate lens whose rays stop tracing, while the
+    constrained run climbs back toward the bound.
+    """
+    lens = _toy_derived(rings=4, fields=(0.0, 20.0))
+    gc = _C.GeometricConstraints.from_optics(lens, min_glass=0.25, min_air=0.1)
+    F = lens.fields_deg.numel(); W = lens.wavelengths_um.numel()
+    P = lens.pupil.shape[0]
+    idx = torch.nonzero(lens.var_mask).squeeze(-1).tolist()
+    t0 = lens.n_surfaces * (2 + lens.max_asph)
+    slot = [i for i, g in enumerate(idx) if g >= t0][0]
+
+    def run(use_gc):
+        ln = _toy_derived(rings=4, fields=(0.0, 20.0))
+        th = ln.get_theta().clone(); th[slot] = 0.05
+        ln.set_theta(th)
+
+        def resid(t):
+            p = ln._pack().clone().to(t.dtype); p[ln.var_mask] = t
+            xy, _, pk = ln._trace_packed(p, probes=True)
+            c = xy.mean(dim=(1, 2), keepdim=True)
+            tra = ((xy - c) / (F * W * P) ** 0.5).reshape(-1)
+            return torch.cat([tra, gc(pk)]) if use_gc else tra
+
+        lm = LevenbergMarquardt(resid, th.clone(), lam0=1.0)
+        lm.run(40)
+        ln.set_theta(lm.theta)
+        return float(ln.ray_probes()["tz"][1].min())
+
+    tz_free = run(False)
+    tz_con = run(True)
+    assert tz_con > 0.2, f"constrained run did not approach the bound: {tz_con}"
+    # the unconstrained run either diverges (NaN) or ignores the bound entirely
+    assert (tz_free != tz_free) or abs(tz_free - 0.25) > abs(tz_con - 0.25)
+
+
+def test_distortion_residuals_is_an_honest_stub():
+    try:
+        _C.distortion_residuals()
+    except NotImplementedError as e:
+        assert "S2.2.3" in str(e) or "paraxial" in str(e)
+    else:
+        raise AssertionError("expected NotImplementedError")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
