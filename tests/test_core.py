@@ -589,16 +589,27 @@ def test_field_convergence_curve_covers_every_field():
 def test_layout_fan_never_exceeds_the_entrance_pupil():
     """The drawn fan must not carry light the stop would block.
 
-    Semi-apertures are derived from the ray footprint, and the derived minimum
-    can exceed epd/2 (on this toy 3.30 mm vs a 2.50 mm pupil radius). Launching
-    the fan at the element radius draws rays the system never collects; at wide
-    field those miss the rear element entirely and leave at absurd angles.
+    Semi-apertures are derived from the ray footprint, and a derived value can
+    exceed epd/2 whichever branch of _limiting_radius supplies it. Launching the
+    fan there draws rays the system never collects; at wide field those miss the
+    rear element entirely and leave at absurd angles.
     """
     from e2e_optics import viz as _V
     optics = _toy_derived(rings=4, fields=(0.0, 30.0))
     rp = _V._limiting_radius(optics)
     cap = 0.5 * float(optics.epd)
     assert rp <= cap + 1e-9, f"fan radius {rp:.3f} mm exceeds pupil radius {cap:.3f} mm"
+
+    # Pin the scenario docs/semi_apertures.md describes: this toy has a FRONT
+    # stop, so the uncapped radius came from the is_stop branch (the stop's own
+    # derived radius), not from min(). Both overflow the pupil here, so the
+    # cap check above passes either way -- assert which branch is live.
+    stops = [i for i, b in enumerate(optics.is_stop) if b]
+    assert stops == [0], f"expected a front stop, got stop indices {stops}"
+    sa = [float(v) for v in optics.semi_aperture]
+    assert sa[0] > cap and min(sa) > cap, (
+        f"doc claims both branches overflow epd/2={cap:.3f}; got stop {sa[0]:.3f}, "
+        f"min {min(sa):.3f}")
 
 
 def test_ray_paths_truncate_instead_of_inventing_intersections():

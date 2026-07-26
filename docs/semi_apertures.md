@@ -76,10 +76,13 @@ for row in optics.aperture_report():
 ## Interaction with the layout view
 
 Derived apertures exposed a separate bug in the layout drawing. The ray fan was
-launched at the smallest clear semi-aperture, which was a safe choice when those
-values were declared by hand but not once they are derived: the derived minimum
-is 3.30 mm against an entrance-pupil radius of 2.50 mm, so the figure drew light
-the aperture stop blocks. At 30 deg those extra rays miss the rear element, and
+launched at a clear semi-aperture -- the aperture stop's own if a stop is
+flagged, otherwise the smallest -- which was a safe choice when those values
+were declared by hand but not once they are derived. The toy flags a front stop,
+so the fan launched at that surface's derived radius of 3.30 mm against an
+entrance-pupil radius of 2.50 mm, and the figure drew light the stop blocks.
+The other branch would have overflowed too: the smallest derived semi-aperture
+is 2.79 mm, also above the pupil. At 30 deg those extra rays miss the rear element, and
 the layout tracer -- which had no validity mask, unlike the main tracer -- let
 Newton converge on the far branch of the conic, producing a vertex 26 mm past a
 sensor sitting at 12 mm and a ray doubling back to y = 69 mm.

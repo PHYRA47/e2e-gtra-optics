@@ -220,11 +220,12 @@ def _limiting_radius(optics) -> float:
     semi-aperture so the fan stays inside every element.
 
     The cap matters now that semi-apertures are DERIVED from the ray footprint
-    (docs/semi_apertures.md): the derived minimum can exceed epd/2 -- on the toy
-    it is 3.30 mm against a 2.50 mm pupil radius -- and launching the fan there
-    draws rays the stop would have blocked. Those rays miss the rear element at
-    wide field and shoot off at absurd angles, which is what put a 69 mm ray in
-    the layout figure.
+    (docs/semi_apertures.md). A derived value can exceed epd/2 whichever branch
+    supplies it: the toy flags a front stop whose own derived clear radius is
+    3.30 mm, and its smallest semi-aperture is 2.79 mm, both above the 2.50 mm
+    pupil radius. Launching the fan at either draws rays the stop blocks; those
+    miss the rear element at wide field and leave at absurd angles, which is
+    what put a 69 mm ray in the layout figure.
     """
     cap = 0.5 * float(optics.epd)
     r = cap
