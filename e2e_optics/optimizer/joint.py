@@ -3,17 +3,17 @@
 Implements the alternating scheme of Cote et al. (2026), Supp. S3.3.1:
 
   For each outer iteration:
-    (1) LENS STEP  -- optics params theta by GTRA + Levenberg-Marquardt,
+    (1) OPTICS STEP  -- optics params theta by GTRA + Levenberg-Marquardt,
                       with the restoration network FROZEN.
     (2) ALGO STEP  -- restoration network params by Adam (SGD-family),
-                      with the lens FROZEN.
+                      with the optics FROZEN.
 
-The GTRA lens step is where the paper's key AD split lives:
+The GTRA optics step is where the paper's key AD split lives:
 
   a. Forward the WHOLE pipeline once at the current theta, compute the scalar
      task loss L, and get grad_L = dL/d(eps) by BACKWARD-mode AD. eps is the
      spot diagram; the graph runs eps -> PSF -> simulate -> restore -> loss.
-     This is the ONE expensive backward pass per lens step.
+     This is the ONE expensive backward pass per optics step.
   b. Freeze (w, eps') from (L, grad_L) -- the GTRA lift (bridge.gtra).
   c. Run LM on residual(theta) = gtra_residuals(spot(theta), L, grad_L). Its
      Jacobian J = sqrt(w) d eps/d theta is taken by FORWARD-mode AD through the
@@ -41,11 +41,11 @@ from .lm import LevenbergMarquardt
 
 @dataclass
 class JointConfig:
-    lm_iters_per_step: int = 3        # inner LM iterations per outer lens step
+    lm_iters_per_step: int = 3        # inner LM iterations per outer optics step
     adam_lr: float = 1e-3
     adam_steps_per_step: int = 1      # inner Adam steps per outer algo step
-    lens_step: bool = True            # set False to freeze optics (train net only)
-    algo_step: bool = True            # set False to freeze net (pure lens design)
+    optics_step: bool = True            # set False to freeze optics (train net only)
+    algo_step: bool = True            # set False to freeze net (pure optics design)
     grid_half_extent: Optional[torch.Tensor] = None   # PSF-grid clip for eps'
     verbose: bool = False
 
@@ -53,7 +53,7 @@ class JointConfig:
 @dataclass
 class JointHistory:
     task_loss: List[float] = field(default_factory=list)
-    lens_esr_um: List[float] = field(default_factory=list)
+    optics_esr_um: List[float] = field(default_factory=list)
 
 
 class JointOptimizer:
@@ -94,8 +94,8 @@ class JointOptimizer:
         restored = self.algorithm.restore(capture, psf=None)
         return self.loss_fn(restored, target)
 
-    def _lens_step(self, scene, target):
-        """One GTRA+LM lens step (network frozen)."""
+    def _optics_step(self, scene, target):
+        """One GTRA+LM optics step (network frozen)."""
         optics = self.optics
         theta = optics.get_theta().detach().clone().requires_grad_(True)
 
@@ -120,12 +120,12 @@ class JointOptimizer:
         return L_val
 
     def _algo_step(self, scene, target):
-        """One Adam step on the restoration network (lens frozen)."""
+        """One Adam step on the restoration network (optics frozen)."""
         if not self._has_net:
             return None
         self.opt.zero_grad()
         with torch.no_grad():
-            spot = self.optics.forward()              # lens frozen
+            spot = self.optics.forward()              # optics frozen
         capture = self.bridge.simulate(spot, scene, add_noise=True)
         restored = self.algorithm.restore(capture, psf=None)
         loss = self.loss_fn(restored, target)
@@ -136,23 +136,23 @@ class JointOptimizer:
     # ------------------------------------------------------------------ #
     def step(self):
         scene, target = self.scene_sampler()
-        L_lens = self._lens_step(scene, target) if self.cfg.lens_step else None
+        L_optics = self._optics_step(scene, target) if self.cfg.optics_step else None
         L_algo = self._algo_step(scene, target) if self.cfg.algo_step else None
         # record the most task-relevant loss available
-        L_rec = L_algo if L_algo is not None else L_lens
+        L_rec = L_algo if L_algo is not None else L_optics
         if L_rec is not None:
             self.history.task_loss.append(L_rec)
         esr = self.optics.forward().effective_spot_radius().item() * 1000.0
-        self.history.lens_esr_um.append(esr)
-        return {"lens_loss": L_lens, "algo_loss": L_algo, "esr_um": esr}
+        self.history.optics_esr_um.append(esr)
+        return {"optics_loss": L_optics, "algo_loss": L_algo, "esr_um": esr}
 
     def run(self, n_iters: int):
         for i in range(n_iters):
             info = self.step()
             if self.cfg.verbose:
-                ll = info['lens_loss']; al = info['algo_loss']
+                ll = info['optics_loss']; al = info['algo_loss']
                 print(f"iter {i:3d}  "
-                      f"lens_loss={ll:.4e}  " if ll is not None else f"iter {i:3d}  "
+                      f"optics_loss={ll:.4e}  " if ll is not None else f"iter {i:3d}  "
                       + (f"algo_loss={al:.4e}  " if al is not None else "")
                       + f"ESR={info['esr_um']:.1f}um")
         return self.history

@@ -8,7 +8,9 @@ Implements the three-part pipeline of Cote, Tseng & Heide,
     (rays)      (PSF +       (restoration
                  GTRA lift)   network)
 
-tied together by a Levenberg-Marquardt engine (lens) + Adam (network).
+tied together by a Levenberg-Marquardt engine (optics) + Adam (network).
+
+The optics stage is element-agnostic: refractive, diffractive or hybrid.
 
 Each stage is an abstract base class with a fixed tensor contract, so any
 concrete implementation that honors the contract is swappable without
@@ -27,7 +29,8 @@ _os.environ.setdefault("OMP_NUM_THREADS", "4")
 # -------------------------------------------------------------------------
 
 from .optics.base import BaseOptics, SpotDiagram
-from .optics.raytrace import RotationallySymmetricLens, Surface
+from .optics.raytrace import RotationallySymmetricOptics, Surface
+from .optics import RotationallySymmetricLens          # deprecated alias
 from .bridge.base import BaseBridge
 from .bridge.kde_psf import kde_psf
 from .bridge.imaging import ConvolutionImaging
@@ -44,7 +47,8 @@ from .viz import OptimizationRecorder
 __version__ = "0.1.0"
 
 __all__ = [
-    "BaseOptics", "SpotDiagram", "RotationallySymmetricLens", "Surface",
+    "BaseOptics", "SpotDiagram", "RotationallySymmetricOptics", "Surface",
+    "RotationallySymmetricLens",   # deprecated alias of RotationallySymmetricOptics
     "BaseBridge", "kde_psf", "ConvolutionImaging",
     "gtra_residuals", "tra_residuals", "tra_control_values",
     "BaseRestoration", "IdentityRestoration", "TinyUNet",

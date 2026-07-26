@@ -1,16 +1,16 @@
 """Toy end-to-end design demo -- the Fig. 4 problem from Cote et al. (2026).
 
 Reproduces the *structure* of the paper's 2-element monochromatic toy: a small
-2-element lens (f/2, EFL 10 mm, 60 deg FOV) imaging a concentric-ring chart onto
+2-element optics (f/2, EFL 10 mm, 60 deg FOV) imaging a concentric-ring chart onto
 a 1024x1024-equivalent sensor, jointly designed with a restoration network.
 
 Three stages, each printing metrics and saving a figure:
 
-  1. STARTING DESIGN        -- weak 2-element lens, large aberration.
+  1. STARTING DESIGN        -- weak 2-element optics, large aberration.
   2. CONVENTIONAL (TRA-LM)  -- minimize the spot with Levenberg-Marquardt on the
                               transverse ray aberration. This is the classical
                               optics baseline (smallest RMS spot).
-  3. END-TO-END (GTRA-LM + Adam) -- alternate a GTRA lens step with an Adam
+  3. END-TO-END (GTRA-LM + Adam) -- alternate a GTRA optics step with an Adam
                               network step. The task loss is MSE between the
                               network's restored image and the sharp scene.
 
@@ -33,7 +33,7 @@ import math
 import numpy as np
 import torch
 
-from e2e_optics.optics.raytrace import RotationallySymmetricLens, Surface
+from e2e_optics.optics.raytrace import RotationallySymmetricOptics, Surface
 from e2e_optics.bridge.imaging import ConvolutionImaging
 from e2e_optics.bridge.gtra import tra_residuals
 from e2e_optics.algorithm.identity import IdentityRestoration
@@ -69,30 +69,30 @@ def mse(a, b):
 # --------------------------------------------------------------------------- #
 #  the starting 2-element design
 # --------------------------------------------------------------------------- #
-def build_toy(rings: int = 8, fields=(0.0, 15.0, 30.0)) -> RotationallySymmetricLens:
+def build_toy(rings: int = 8, fields=(0.0, 15.0, 30.0)) -> RotationallySymmetricOptics:
     surfaces = [
         Surface(1 / 5.0,   0.0, [0., 0., 0.], 2.2, N_GLASS, True,  2.6),
         Surface(-1 / 18.0, 0.0, [0., 0., 0.], 2.0, 1.0,     False, 2.8),
         Surface(1 / 9.0,   0.0, [0., 0., 0.], 2.2, N_GLASS, False, 3.4),
         Surface(-1 / 9.0,  0.0, [0., 0., 0.], 2.1, 1.0,     False, 3.8),
     ]
-    return RotationallySymmetricLens(
+    return RotationallySymmetricOptics(
         surfaces, epd=5.0, fields_deg=list(fields), wavelengths_um=[0.5876],
         n_pupil_rings=rings, variables=("curvature", "asph", "thickness"), dtype=DT)
 
 
-def optimize_tra(lens: RotationallySymmetricLens, n_iters: int = 40):
+def optimize_tra(optics: RotationallySymmetricOptics, n_iters: int = 40):
     """Conventional spot minimization via LM on TRA residuals."""
-    F = lens.fields_deg.numel(); W = lens.wavelengths_um.numel(); P = lens.pupil.shape[0]
+    F = optics.fields_deg.numel(); W = optics.wavelengths_um.numel(); P = optics.pupil.shape[0]
 
     def resid(th):
-        xy = lens.spot_from_theta(th).reshape(F, W, P, 2)
+        xy = optics.spot_from_theta(th).reshape(F, W, P, 2)
         c = xy.mean(dim=(1, 2), keepdim=True)
         return ((xy - c) / (F * W * P) ** 0.5).reshape(-1)
 
-    lm = LevenbergMarquardt(resid, lens.get_theta(), lam0=1.0)
+    lm = LevenbergMarquardt(resid, optics.get_theta(), lam0=1.0)
     lm.run(n_iters)
-    lens.set_theta(lm.theta)
+    optics.set_theta(lm.theta)
     return lm.history
 
 
@@ -104,36 +104,36 @@ def main(outdir: str = "."):
     sampler = lambda: (scene, scene)
 
     # 1. STARTING DESIGN --------------------------------------------------
-    lens = build_toy()
-    esr_start = lens.forward().effective_spot_radius().item() * 1000
+    optics = build_toy()
+    esr_start = optics.forward().effective_spot_radius().item() * 1000
     print(f"[1] starting design      ESR = {esr_start:6.1f} um")
 
     # 2. CONVENTIONAL TRA-LM ---------------------------------------------
-    tra_hist = optimize_tra(lens, 40)
-    esr_tra = lens.forward().effective_spot_radius().item() * 1000
-    theta_tra = lens.get_theta().clone()
+    tra_hist = optimize_tra(optics, 40)
+    esr_tra = optics.forward().effective_spot_radius().item() * 1000
+    theta_tra = optics.get_theta().clone()
     print(f"[2] TRA-LM (min-spot)    ESR = {esr_tra:6.1f} um  "
           f"(merit {tra_hist[0]:.2e} -> {tra_hist[-1]:.2e})")
 
     # imaging model at paper-like pixel scale (spot ~ 1.8 px -> mild blur)
     bridge = ConvolutionImaging(grid_size=25, pixel_pitch_mm=0.0113,
                                 sigma_bins=2.0, noise_std_frac=0.002, seed=1)
-    cap_blur = bridge.simulate(lens.forward(), scene, add_noise=True)
+    cap_blur = bridge.simulate(optics.forward(), scene, add_noise=True)
     print(f"    blurred capture PSNR = {psnr(cap_blur, scene):5.2f} dB")
 
-    # 3. END-TO-END: joint GTRA-LM lens + Adam net ------------------------
+    # 3. END-TO-END: joint GTRA-LM optics + Adam net ------------------------
     net = TinyUNet(channels=1, width=16).to(DT)
-    # (a) warm up the network on the TRA lens (network-only Adam)
-    warm = JointOptimizer(lens, bridge, net, mse, sampler,
-                          JointConfig(adam_lr=3e-3, algo_step=True, lens_step=False))
+    # (a) warm up the network on the TRA optics (network-only Adam)
+    warm = JointOptimizer(optics, bridge, net, mse, sampler,
+                          JointConfig(adam_lr=3e-3, algo_step=True, optics_step=False))
     warm.run(250)
-    # (b) joint fine-tune: lens GTRA-LM + net Adam together
-    joint = JointOptimizer(lens, bridge, net, mse, sampler,
+    # (b) joint fine-tune: optics GTRA-LM + net Adam together
+    joint = JointOptimizer(optics, bridge, net, mse, sampler,
                            JointConfig(lm_iters_per_step=2, adam_lr=1e-3,
-                                       algo_step=True, lens_step=True))
+                                       algo_step=True, optics_step=True))
     jhist = joint.run(30)
-    esr_e2e = lens.forward().effective_spot_radius().item() * 1000
-    restored = net.restore(bridge.simulate(lens.forward(), scene, add_noise=True))
+    esr_e2e = optics.forward().effective_spot_radius().item() * 1000
+    restored = net.restore(bridge.simulate(optics.forward(), scene, add_noise=True))
     print(f"[3] end-to-end (GTRA+Adam) ESR = {esr_e2e:6.1f} um  "
           f"restored PSNR = {psnr(restored, scene):5.2f} dB")
 
@@ -165,7 +165,7 @@ def _figures(outdir, scene, blurred, restored, tra_hist, jhist,
     fig2, (a1, a2) = plt.subplots(1, 2, figsize=(7.2, 3.0))
     a1.semilogy(range(len(tra_hist)), tra_hist, color='#2166ac', lw=1.5, marker='o', ms=2)
     a1.set_xlabel("LM iteration"); a1.set_ylabel(r"$\frac{1}{2}\|\ell_{\mathrm{TRA}}\|^2$")
-    a1.set_title("Conventional TRA-LM lens design")
+    a1.set_title("Conventional TRA-LM optics design")
     a2.plot(range(len(jhist.task_loss)), jhist.task_loss, color='#b2182b', lw=1.5, marker='o', ms=2)
     a2.set_xlabel("joint iteration"); a2.set_ylabel("task MSE")
     a2.set_title("End-to-end joint fine-tune")

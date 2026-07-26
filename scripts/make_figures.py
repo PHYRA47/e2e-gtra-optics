@@ -12,7 +12,7 @@ Figures produced
                                  entrance pupil, transparent glass, bends on the
                                  true surface curves
   fig_viz_layout_chromatic.png   on-axis F/d/C with the focus-region zoom inset
-  fig_lens_layout.png            dense meridional fan (compatibility name)
+  fig_layout_fan.png             dense meridional fan
   fig_spot_start.png             starting-design spot diagram
   fig_psf.png                    differentiable KDE geometric PSF
   fig_viz_compare.png            before/after (paper Fig. 4 style)
@@ -39,7 +39,7 @@ import matplotlib
 matplotlib.use("Agg")
 import torch
 
-from e2e_optics.optics.raytrace import RotationallySymmetricLens, Surface
+from e2e_optics.optics.raytrace import RotationallySymmetricOptics, Surface
 from e2e_optics.bridge.imaging import ConvolutionImaging
 from e2e_optics.optimizer.lm import LevenbergMarquardt
 from e2e_optics import viz
@@ -53,7 +53,7 @@ N_BK7, V_BK7 = 1.5168, 64.17
 
 
 def build_toy(chromatic: bool, rings: int = 8):
-    """Toy 2-element f/2 lens. ``chromatic`` decides whether it carries the
+    """Toy 2-element f/2 optics. ``chromatic`` decides whether it carries the
     F/d/C triplet (N-BK7 Abbe data, dispersion on) or a single d-line (mono)."""
     wl = [0.4861, 0.5876, 0.6563] if chromatic else [0.5876]
     S = Surface
@@ -63,22 +63,22 @@ def build_toy(chromatic: bool, rings: int = 8):
         S(1 / 9.0,   0.0, [0., 0., 0.], 2.2, N_BK7, False, 3.4, V_BK7),
         S(-1 / 9.0,  0.0, [0., 0., 0.], 2.1, 1.0,   False, 3.8),
     ]
-    return RotationallySymmetricLens(
+    return RotationallySymmetricOptics(
         surfaces, epd=5.0, fields_deg=[0.0, 15.0, 30.0], wavelengths_um=wl,
         n_pupil_rings=rings, variables=("curvature", "asph", "thickness"),
         dispersion=chromatic, dtype=DT)
 
 
-def optimize_tra(lens, n_iters=40, callback=None):
+def optimize_tra(optics, n_iters=40, callback=None):
     """Conventional spot minimization via LM on TRA residuals."""
-    F = lens.fields_deg.numel(); W = lens.wavelengths_um.numel(); P = lens.pupil.shape[0]
+    F = optics.fields_deg.numel(); W = optics.wavelengths_um.numel(); P = optics.pupil.shape[0]
 
     def resid(th):
-        xy = lens.spot_from_theta(th).reshape(F, W, P, 2)
+        xy = optics.spot_from_theta(th).reshape(F, W, P, 2)
         c = xy.mean(dim=(1, 2), keepdim=True)
         return ((xy - c) / (F * W * P) ** 0.5).reshape(-1)
 
-    lm = LevenbergMarquardt(resid, lens.get_theta(), lam0=1.0)
+    lm = LevenbergMarquardt(resid, optics.get_theta(), lam0=1.0)
     lm.run(n_iters, callback=callback)
     return lm
 
@@ -88,47 +88,47 @@ def main(out="docs/figures"):
     P = lambda name: os.path.join(out, name)
 
     # ---- layout figures (chromatic tracer, redesigned renderer) ----------
-    lens_c = build_toy(chromatic=True)
-    f = viz.plot_lens_layout(lens_c, rays="chief_marginal",
-                             title="Toy 2-element lens \u2014 chief + marginal rays")
+    opt_c = build_toy(chromatic=True)
+    f = viz.plot_layout(opt_c, rays="chief_marginal",
+                             title="Toy 2-element optics \u2014 chief + marginal rays")
     f.savefig(P("fig_viz_layout.png"), dpi=200, bbox_inches="tight")
 
-    f = viz.plot_lens_layout(lens_c, field_index=0, chromatic=True,
+    f = viz.plot_layout(opt_c, field_index=0, chromatic=True,
                              title="On-axis chromatic (F/d/C) + focus zoom")
     f.savefig(P("fig_viz_layout_chromatic.png"), dpi=200, bbox_inches="tight")
 
-    f = viz.plot_lens_layout(lens_c, rays="fan", n_fan=9,
+    f = viz.plot_layout(opt_c, rays="fan", n_fan=9,
                              title="Meridional ray fan")
-    f.savefig(P("fig_lens_layout.png"), dpi=200, bbox_inches="tight")
+    f.savefig(P("fig_layout_fan.png"), dpi=200, bbox_inches="tight")
 
     # ---- starting-design diagnostics (monochromatic toy) -----------------
-    lens = build_toy(chromatic=False)
-    theta_start = lens.get_theta().clone()
-    f = viz.plot_spot_diagram(lens, title="Starting design \u2014 spot diagram")
+    optics = build_toy(chromatic=False)
+    theta_start = optics.get_theta().clone()
+    f = viz.plot_spot_diagram(optics, title="Starting design \u2014 spot diagram")
     f.savefig(P("fig_spot_start.png"), dpi=200, bbox_inches="tight")
 
     bridge = ConvolutionImaging(grid_size=25, pixel_pitch_mm=0.0113,
                                 sigma_bins=2.0, noise_std_frac=0.002, seed=1)
-    f = viz.plot_psf(lens, bridge, title="Differentiable geometric PSF (KDE)")
+    f = viz.plot_psf(optics, bridge, title="Differentiable geometric PSF (KDE)")
     f.savefig(P("fig_psf.png"), dpi=200, bbox_inches="tight")
 
     # ---- optimize + before/after + convergence + evolution ---------------
-    rec = viz.OptimizationRecorder(lens)
-    lm = optimize_tra(lens, 40, callback=rec)
+    rec = viz.OptimizationRecorder(optics)
+    lm = optimize_tra(optics, 40, callback=rec)
     theta_opt = lm.theta.clone()
 
-    f = viz.compare_lenses(lens, theta_start, theta_opt,
+    f = viz.compare_designs(optics, theta_start, theta_opt,
                            labels=("start", "optimized"), view_um=80)
     f.savefig(P("fig_viz_compare.png"), dpi=200, bbox_inches="tight")
 
-    f = viz.plot_convergence(lm.history, title="Conventional TRA-LM lens design")
+    f = viz.plot_convergence(lm.history, title="Conventional TRA-LM optics design")
     f.savefig(P("fig_lm_convergence.png"), dpi=200, bbox_inches="tight")
 
-    lens.set_theta(theta_start)
-    f = viz.plot_spot_evolution(lens, rec, n_show=6)
+    optics.set_theta(theta_start)
+    f = viz.plot_spot_evolution(optics, rec, n_show=6)
     f.savefig(P("fig_viz_evolution.png"), dpi=200, bbox_inches="tight")
-    viz.animate_spot_evolution(lens, rec, P("fig_viz_evolution.gif"), fps=6)
-    lens.set_theta(theta_opt)
+    viz.animate_spot_evolution(optics, rec, P("fig_viz_evolution.gif"), fps=6)
+    optics.set_theta(theta_opt)
     print("layout / spot / evolution figures ->", out)
 
     # ---- demo restoration + summary (reuses the demo pipeline) -----------

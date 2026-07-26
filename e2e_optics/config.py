@@ -1,6 +1,6 @@
 """One small config surface so the three parts are swapped *by name*.
 
-    cfg = PipelineConfig(optics="rotational_lens", bridge="kde_conv",
+    cfg = PipelineConfig(optics="rotational_symmetric", bridge="kde_conv",
                          algorithm="identity")
     optics, bridge, algo = build_pipeline(cfg, optics_kwargs={...}, ...)
 
@@ -15,8 +15,8 @@ from typing import Any, Dict
 
 # --- registries: name -> class -----------------------------------------------
 def _optics_registry():
-    from .optics.raytrace import RotationallySymmetricLens
-    return {"rotational_lens": RotationallySymmetricLens}
+    from .optics.raytrace import RotationallySymmetricOptics
+    return {"rotational_symmetric": RotationallySymmetricOptics}
 
 
 def _bridge_registry():
@@ -32,7 +32,7 @@ def _algorithm_registry():
 
 @dataclass
 class PipelineConfig:
-    optics: str = "rotational_lens"
+    optics: str = "rotational_symmetric"
     bridge: str = "kde_conv"
     algorithm: str = "identity"
     optics_kwargs: Dict[str, Any] = field(default_factory=dict)

@@ -1,25 +1,25 @@
 """Diagnostic and comparison plots for the e2e_optics pipeline.
 
 This is the reusable visualization layer -- every figure produced during the
-build lives here as a function you can call on any lens / bridge / result, so
+build lives here as a function you can call on any optics / bridge / result, so
 the plots are part of the code base rather than throwaway script cells.
 
 Two families:
 
-*Single-state diagnostics* (one lens):
-    plot_lens_layout(lens)          -- ray-fan layout + surface profiles
-    plot_spot_diagram(lens)         -- per-field spot scatter
-    plot_psf(lens, bridge)          -- geometric PSF grids
+*Single-state diagnostics* (one optics):
+    plot_layout(optics)          -- ray-fan layout + surface profiles
+    plot_spot_diagram(optics)         -- per-field spot scatter
+    plot_psf(optics, bridge)          -- geometric PSF grids
     plot_convergence(history)       -- LM / task-loss curves
 
 *Before / after comparison* (paper Fig. 4 style):
-    compare_lenses(lens, theta_a, theta_b, ...)   -- side-by-side layout+spots
+    compare_designs(optics, theta_a, theta_b, ...)   -- side-by-side layout+spots
     plot_restoration(scene, blurred, restored)    -- capture vs restored triptych
 
 *Progressive / evolution view* (question 3):
     OptimizationRecorder    -- callback that snapshots theta each LM iteration
-    plot_spot_evolution(lens, recorder)           -- spot vs iteration grid
-    animate_spot_evolution(lens, recorder, path)  -- GIF of the spot shrinking
+    plot_spot_evolution(optics, recorder)           -- spot vs iteration grid
+    animate_spot_evolution(optics, recorder, path)  -- GIF of the spot shrinking
 
 All functions return a matplotlib Figure so you can further tweak or save it.
 Nothing here touches autograd -- everything is detached and CPU-friendly.
@@ -58,7 +58,7 @@ class VizStyle:
 
         dark = viz.VizStyle(window_facecolor='#111', figure_facecolor='#111',
                             font_color='w', glass_facecolor='#22364a')
-        viz.plot_lens_layout(lens, style=dark)
+        viz.plot_layout(optics, style=dark)
 
     Groups map onto the four things you asked to control:
       * **surfaces**  -> glass_* / surface_edge_*
@@ -67,7 +67,7 @@ class VizStyle:
       * **font** -> font_color / font_family / *_size
     """
     # --- surfaces (the glass elements) ---
-    glass_facecolor: str = '#bfe0f5'      # fill of a closed lens element
+    glass_facecolor: str = '#bfe0f5'      # fill of a closed optics element
     glass_alpha: float = 0.0              # 0 = transparent (outline only)
     surface_edge_color: str = '#14405c'   # outline of the glass
     surface_edge_lw: float = 1.4
@@ -137,58 +137,58 @@ def _style_axes(ax, st: VizStyle):
     ax.title.set_fontsize(st.title_size)
 
 
-def _field_labels(lens):
-    return [f"{float(a):.0f}\u00b0" for a in lens.fields_deg]
+def _field_labels(optics):
+    return [f"{float(a):.0f}\u00b0" for a in optics.fields_deg]
 
 
 # --------------------------------------------------------------------------- #
-#  closed glass-element geometry  (draw a real lens body, not bare curves)
+#  closed glass-element geometry  (draw a real optics body, not bare curves)
 # --------------------------------------------------------------------------- #
-def _sag_profile(lens, si: int, R: float, n: int = 160):
+def _sag_profile(optics, si: int, R: float, n: int = 160):
     """(z, r) of surface ``si`` sampled to outer radius ``R``.
 
     Beyond the surface's own clear semi-aperture the sag is held flat at its
     edge value, giving a ground annular edge instead of an extrapolated (and
     possibly divergent) aspheric tail.
     """
-    sa = float(lens.semi_aperture[si])
-    r = torch.linspace(-R, R, n, dtype=lens.dtype)
+    sa = float(optics.semi_aperture[si])
+    r = torch.linspace(-R, R, n, dtype=optics.dtype)
     r_clamped = torch.clamp(r, -sa, sa)
     u = r_clamped * r_clamped
-    z = asphere_sag(u, lens.curv[si], lens.conic[si], lens.asph[si])
-    z_vert = torch.cat([torch.zeros(1, dtype=lens.dtype),
-                        torch.cumsum(lens.thick, 0)])
+    z = asphere_sag(u, optics.curv[si], optics.conic[si], optics.asph[si])
+    z_vert = torch.cat([torch.zeros(1, dtype=optics.dtype),
+                        torch.cumsum(optics.thick, 0)])
     return (z + z_vert[si]).detach().numpy(), r.detach().numpy()
 
 
-def _glass_spans(lens):
+def _element_spans(optics):
     """List of (i_front, i_back) surface-index pairs bounding each glass element.
 
     A gap after surface i is glass when ``n_after[i] > 1``; that gap is bounded
     by surfaces i (front) and i+1 (back).
     """
-    n_after = lens.n_after.detach().numpy().ravel() if lens.n_after.dim() == 1 \
-        else lens.n_after.detach().numpy()[:, 0]
+    n_after = optics.n_after.detach().numpy().ravel() if optics.n_after.dim() == 1 \
+        else optics.n_after.detach().numpy()[:, 0]
     spans = []
-    for i in range(lens.n_surfaces - 1):
+    for i in range(optics.n_surfaces - 1):
         if float(n_after[i]) > 1.0 + 1e-6:
             spans.append((i, i + 1))
     return spans
 
 
-def _draw_elements(ax, lens, st: VizStyle):
+def _draw_elements(ax, optics, st: VizStyle):
     """Draw each glass element as a filled, closed body with vertical rim edges.
 
     Returns the outer radius used (max semi-aperture) so the caller can size
     the ray fan and axes to match.
     """
     from matplotlib.patches import Polygon
-    spans = _glass_spans(lens)
+    spans = _element_spans(optics)
     drawn = set()
     for (i_f, i_b) in spans:
-        R = max(float(lens.semi_aperture[i_f]), float(lens.semi_aperture[i_b]))
-        zf, rf = _sag_profile(lens, i_f, R)
-        zb, rb = _sag_profile(lens, i_b, R)
+        R = max(float(optics.semi_aperture[i_f]), float(optics.semi_aperture[i_b]))
+        zf, rf = _sag_profile(optics, i_f, R)
+        zb, rb = _sag_profile(optics, i_b, R)
         # closed polygon: front surface bottom->top, back surface top->bottom
         xs = np.concatenate([zf, zb[::-1]])
         ys = np.concatenate([rf, rb[::-1]])
@@ -202,26 +202,26 @@ def _draw_elements(ax, lens, st: VizStyle):
         ax.add_patch(poly)
         drawn.update((i_f, i_b))
     # any surfaces not part of a glass element (e.g. a bare stop) -> thin line
-    for si in range(lens.n_surfaces):
+    for si in range(optics.n_surfaces):
         if si in drawn:
             continue
-        z, r = _sag_profile(lens, si, float(lens.semi_aperture[si]))
+        z, r = _sag_profile(optics, si, float(optics.semi_aperture[si]))
         ax.plot(z, r, color=st.surface_edge_color, lw=st.surface_edge_lw,
                 zorder=3)
-    return max(float(s) for s in lens.semi_aperture)
+    return max(float(s) for s in optics.semi_aperture)
 
 
-def _limiting_radius(lens) -> float:
+def _limiting_radius(optics) -> float:
     """Half-height for the layout ray fan: the aperture-stop clear radius if a
     stop is flagged, else the smallest clear semi-aperture (so the fan stays
     inside every element)."""
-    for si, is_stop in enumerate(lens.is_stop):
+    for si, is_stop in enumerate(optics.is_stop):
         if is_stop:
-            return float(lens.semi_aperture[si])
-    return min(float(s) for s in lens.semi_aperture)
+            return float(optics.semi_aperture[si])
+    return min(float(s) for s in optics.semi_aperture)
 
 
-def _entrance_pupil_z(lens) -> float:
+def _entrance_pupil_z(optics) -> float:
     """z of the entrance pupil plane (mm).
 
     For the object-at-infinity collimated model the bundles are launched at the
@@ -229,15 +229,15 @@ def _entrance_pupil_z(lens) -> float:
     it, at z = 0 (the tangent plane to the first surface). If the stop is an
     interior surface, use that vertex.
     """
-    z_vert = torch.cat([torch.zeros(1, dtype=lens.dtype),
-                        torch.cumsum(lens.thick, 0)])
-    for si, is_stop in enumerate(lens.is_stop):
+    z_vert = torch.cat([torch.zeros(1, dtype=optics.dtype),
+                        torch.cumsum(optics.thick, 0)])
+    for si, is_stop in enumerate(optics.is_stop):
         if is_stop:
             return float(z_vert[si])
     return 0.0
 
 
-def _draw_cross_section(ax, lens, st: VizStyle, rays: str = "chief_marginal",
+def _draw_cross_section(ax, optics, st: VizStyle, rays: str = "chief_marginal",
                         n_fan: int = 9, fields=None, chromatic: bool = False,
                         show_image_plane: bool = True, show_pupil: bool = True):
     """Shared layout renderer: closed elements + traced rays.
@@ -253,29 +253,29 @@ def _draw_cross_section(ax, lens, st: VizStyle, rays: str = "chief_marginal",
     inside the glass, and each ray is drawn on its OWN per-surface intersection
     z, so bends sit exactly on the surface curves.
     """
-    R_out = _draw_elements(ax, lens, st)
-    rp = _limiting_radius(lens)
-    z_img = float(torch.cumsum(lens.thick, 0)[-1])
+    R_out = _draw_elements(ax, optics, st)
+    rp = _limiting_radius(optics)
+    z_img = float(torch.cumsum(optics.thick, 0)[-1])
     nf = 3 if rays == "chief_marginal" else int(n_fan)
     if show_image_plane:
         ax.axvline(z_img, color=st.image_plane_color, ls='--', lw=1.0, zorder=1)
     # entrance pupil plane (a short vertical marker at the stop vertex)
     if show_pupil:
-        z_ep = _entrance_pupil_z(lens)
+        z_ep = _entrance_pupil_z(optics)
         ax.plot([z_ep, z_ep], [-rp, rp], color=st.pupil_color, lw=1.2,
                 ls=(0, (4, 2)), zorder=1)
         for s in (-1, 1):
             ax.plot([z_ep], [s * rp], marker='_', color=st.pupil_color,
                     ms=7, zorder=1)
     if fields is None:
-        fields = range(lens.fields_deg.numel())
+        fields = range(optics.fields_deg.numel())
     # dispersion is meaningful only with >1 wavelength
-    W = lens.wavelengths_um.numel()
+    W = optics.wavelengths_um.numel()
     w_indices = range(W) if (chromatic and W > 1) else [0]
     for fi in fields:
         for wi in w_indices:
             col = st.wcolor(wi) if (chromatic and W > 1) else st.color(fi)
-            zs, ys = lens.ray_paths(field_index=fi, wavelength_index=wi,
+            zs, ys = optics.ray_paths(field_index=fi, wavelength_index=wi,
                                     n_fan=nf, pupil_radius=rp)
             for j in range(ys.shape[0]):
                 ax.plot(zs[j].numpy(), ys[j].numpy(), color=col, lw=st.ray_lw,
@@ -287,16 +287,16 @@ def _draw_cross_section(ax, lens, st: VizStyle, rays: str = "chief_marginal",
 # --------------------------------------------------------------------------- #
 #  single-state diagnostics
 # --------------------------------------------------------------------------- #
-def _layout_legend(ax, lens, st, chromatic):
+def _layout_legend(ax, optics, st, chromatic):
     """Legend keyed by wavelength (chromatic) or field (monochromatic)."""
-    if chromatic and lens.wavelengths_um.numel() > 1:
-        labels = [f"{float(w)*1000:.0f} nm" for w in lens.wavelengths_um]
+    if chromatic and optics.wavelengths_um.numel() > 1:
+        labels = [f"{float(w)*1000:.0f} nm" for w in optics.wavelengths_um]
         handles = [plt.Line2D([], [], color=st.wcolor(i), label=l)
                    for i, l in enumerate(labels)]
         title = "wavelength"
     else:
         handles = [plt.Line2D([], [], color=st.color(i), label=l)
-                   for i, l in enumerate(_field_labels(lens))]
+                   for i, l in enumerate(_field_labels(optics))]
         title = "field"
     leg = ax.legend(handles=handles, fontsize=st.tick_size, title=title,
                     loc='upper left', framealpha=0.9)
@@ -307,7 +307,7 @@ def _layout_legend(ax, lens, st, chromatic):
         txt.set_color(st.font_color)
 
 
-def _focus_inset(ax, lens, st, field_index, rays, n_fan):
+def _focus_inset(ax, optics, st, field_index, rays, n_fan):
     """Magnified inset on the focus region so per-wavelength (chromatic) ray
     separation is visible even when it is sub-pixel on the full-scale axes.
 
@@ -316,18 +316,18 @@ def _focus_inset(ax, lens, st, field_index, rays, n_fan):
     the same rays there. Returns the inset axes (or None if <2 wavelengths).
     """
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
-    W = lens.wavelengths_um.numel()
+    W = optics.wavelengths_um.numel()
     if W < 2:
         return None
-    z_img = float(torch.cumsum(lens.thick, 0)[-1])
-    rp = _limiting_radius(lens)
+    z_img = float(torch.cumsum(optics.thick, 0)[-1])
+    rp = _limiting_radius(optics)
     nf = 3 if rays == "chief_marginal" else int(n_fan)
     # collect each ray's final straight segment (exit of last surface -> image)
     # per wavelength; between the last surface and the image plane rays are
     # straight, so we can resample them at any z to find best focus.
     segs = []  # (wi, z_exit(nf,), y_exit(nf,), slope(nf,))
     for wi in range(W):
-        zs, ys = lens.ray_paths(field_index=field_index, wavelength_index=wi,
+        zs, ys = optics.ray_paths(field_index=field_index, wavelength_index=wi,
                                 n_fan=nf, pupil_radius=rp)
         z0 = zs[:, -2].numpy(); z1 = zs[:, -1].numpy()
         y0 = ys[:, -2].numpy(); y1 = ys[:, -1].numpy()
@@ -379,9 +379,9 @@ def _focus_inset(ax, lens, st, field_index, rays, n_fan):
     return axin
 
 
-def plot_lens_layout(lens, field_index: Optional[int] = None,
+def plot_layout(optics, field_index: Optional[int] = None,
                      rays: str = "chief_marginal", n_fan: int = 9,
-                     chromatic: bool = False, title: str = "Lens layout",
+                     chromatic: bool = False, title: str = "Optical layout",
                      focus_inset: Optional[bool] = None,
                      style: Optional[VizStyle] = None):
     """Cross-section drawing: closed glass elements + traced rays.
@@ -403,7 +403,7 @@ def plot_lens_layout(lens, field_index: Optional[int] = None,
     st = _S(style)
     fig, ax = _fig(w=6.4, h=3.4, style=st)
     fields = [field_index] if field_index is not None else None
-    z_img, R_out = _draw_cross_section(ax, lens, st, rays=rays, n_fan=n_fan,
+    z_img, R_out = _draw_cross_section(ax, optics, st, rays=rays, n_fan=n_fan,
                                        fields=fields, chromatic=chromatic)
     ax.text(z_img, R_out * 1.05, "image", ha='center', va='bottom',
             fontsize=st.tick_size, color=st.image_plane_color,
@@ -411,27 +411,27 @@ def plot_lens_layout(lens, field_index: Optional[int] = None,
     ax.set_xlabel("z  (mm)"); ax.set_ylabel("y  (mm)")
     ax.set_title(title)
     ax.grid(True, color=st.grid_color, alpha=st.grid_alpha, zorder=0)
-    multi_field = (field_index is None and lens.fields_deg.numel() > 1)
-    if multi_field or (chromatic and lens.wavelengths_um.numel() > 1):
-        _layout_legend(ax, lens, st, chromatic)
+    multi_field = (field_index is None and optics.fields_deg.numel() > 1)
+    if multi_field or (chromatic and optics.wavelengths_um.numel() > 1):
+        _layout_legend(ax, optics, st, chromatic)
     # focus-region zoom: default on when chromatic (color split is often
     # sub-pixel on the full-scale axes) and a single field is shown
     want_inset = focus_inset
     if want_inset is None:
-        want_inset = bool(chromatic and lens.wavelengths_um.numel() > 1
+        want_inset = bool(chromatic and optics.wavelengths_um.numel() > 1
                           and field_index is not None)
     if want_inset:
         fi = field_index if field_index is not None else 0
-        _focus_inset(ax, lens, st, fi, rays, n_fan)
+        _focus_inset(ax, optics, st, fi, rays, n_fan)
     fig.tight_layout()
     return fig
 
 
-def plot_spot_diagram(lens, wavelength_index: int = 0, title: str = "Spot diagram",
+def plot_spot_diagram(optics, wavelength_index: int = 0, title: str = "Spot diagram",
                       view_um: Optional[float] = None, style: Optional[VizStyle] = None):
     """Per-field spot scatter (microns, centroid-referenced)."""
     st = _S(style)
-    sp = lens.forward()
+    sp = optics.forward()
     F = sp.xy.shape[0]
     cent = sp.centroids()
     fig, axs = _fig(1, F, w=2.6, h=2.8, style=st)
@@ -445,7 +445,7 @@ def plot_spot_diagram(lens, wavelength_index: int = 0, title: str = "Spot diagra
         pts = pts.detach().numpy()
         ax.scatter(pts[:, 0], pts[:, 1], s=3, color=st.color(fi),
                    alpha=0.6, edgecolors='none')
-        ax.set_title(f"{_field_labels(lens)[fi]}   RMS {float(rms[fi])*1000:.1f} \u00b5m")
+        ax.set_title(f"{_field_labels(optics)[fi]}   RMS {float(rms[fi])*1000:.1f} \u00b5m")
         ax.set_aspect('equal')
         ax.axhline(0, color=st.grid_color, lw=0.5); ax.axvline(0, color=st.grid_color, lw=0.5)
         if view_um:
@@ -459,7 +459,7 @@ def plot_spot_diagram(lens, wavelength_index: int = 0, title: str = "Spot diagra
     return fig
 
 
-def plot_psf(lens, bridge, title: str = "Geometric PSF (KDE)",
+def plot_psf(optics, bridge, title: str = "Geometric PSF (KDE)",
              cmap: str = 'inferno', style: Optional[VizStyle] = None):
     """Per-field PSF grid, built with the bridge's KDE settings.
 
@@ -469,7 +469,7 @@ def plot_psf(lens, bridge, title: str = "Geometric PSF (KDE)",
     """
     from .bridge.kde_psf import kde_psf
     st = _S(style)
-    sp = lens.forward()
+    sp = optics.forward()
     psf = kde_psf(sp, bridge.grid_size, bridge.pixel_pitch_mm,
                   bridge.sigma_bins, per_field=True)   # (F,W,G,G)
     F = psf.shape[0]
@@ -480,7 +480,7 @@ def plot_psf(lens, bridge, title: str = "Geometric PSF (KDE)",
         ax = axs[fi]
         p = psf[fi, 0].detach().numpy()
         ax.imshow(p, cmap=cmap)
-        ax.set_title(_field_labels(lens)[fi])
+        ax.set_title(_field_labels(optics)[fi])
         ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle(title, fontsize=st.title_size, color=st.font_color,
                  fontfamily=st.font_family)
@@ -507,34 +507,34 @@ def plot_convergence(history, ylabel: str = r"$\frac{1}{2}\|\ell\|^2$",
 # --------------------------------------------------------------------------- #
 #  before / after comparison  (paper Fig. 4 style)
 # --------------------------------------------------------------------------- #
-def compare_lenses(lens, theta_before, theta_after,
+def compare_designs(optics, theta_before, theta_after,
                    labels=("start", "optimized"), rays: str = "chief_marginal",
                    n_fan: int = 9, chromatic: bool = False,
                    view_um: Optional[float] = None, style: Optional[VizStyle] = None):
     """2x2: layout (before / after) over spot diagrams (before / after).
 
     Uses the same closed-element / entrance-pupil ray renderer as
-    ``plot_lens_layout`` (chief+marginal rays by default; ``chromatic=True``
-    for per-wavelength colouring). Restores ``lens`` to its incoming theta on
+    ``plot_layout`` (chief+marginal rays by default; ``chromatic=True``
+    for per-wavelength colouring). Restores ``optics`` to its incoming theta on
     exit, so it is side-effect free.
     """
     st = _S(style)
-    theta_saved = lens.get_theta().clone()
+    theta_saved = optics.get_theta().clone()
     fig, axs = plt.subplots(2, 2, figsize=(9.0, 6.4))
     fig.patch.set_facecolor(st.figure_facecolor)
     for a in axs.ravel():
         _style_axes(a, st)
     for col, (th, lab) in enumerate(zip((theta_before, theta_after), labels)):
-        lens.set_theta(th)
+        optics.set_theta(th)
         # --- layout (top row) ---
         axL = axs[0, col]
-        _draw_cross_section(axL, lens, st, rays=rays, n_fan=n_fan,
+        _draw_cross_section(axL, optics, st, rays=rays, n_fan=n_fan,
                             chromatic=chromatic)
         axL.set_title(f"{lab} \u2014 layout")
         axL.set_xlabel("z (mm)"); axL.set_ylabel("y (mm)")
         # --- worst-field spot (bottom row) ---
         axS = axs[1, col]
-        sp = lens.forward(); cent = sp.centroids(); rms = sp.rms_radius()
+        sp = optics.forward(); cent = sp.centroids(); rms = sp.rms_radius()
         fi = int(torch.argmax(rms))
         m = sp.valid[fi, 0]
         pts = ((sp.xy[fi, 0][m] - cent[fi]) * 1000.0).detach().numpy()
@@ -542,11 +542,11 @@ def compare_lenses(lens, theta_before, theta_after,
                     color=st.color(fi), alpha=0.6, edgecolors='none')
         axS.set_aspect('equal')
         esr = float(sp.effective_spot_radius()) * 1000
-        axS.set_title(f"{lab} \u2014 spot @ {_field_labels(lens)[fi]}  (ESR {esr:.1f} \u00b5m)")
+        axS.set_title(f"{lab} \u2014 spot @ {_field_labels(optics)[fi]}  (ESR {esr:.1f} \u00b5m)")
         axS.set_xlabel("x (\u00b5m)"); axS.set_ylabel("y (\u00b5m)")
         if view_um:
             axS.set_xlim(-view_um, view_um); axS.set_ylim(-view_um, view_um)
-    lens.set_theta(theta_saved)
+    optics.set_theta(theta_saved)
     fig.tight_layout()
     return fig
 
@@ -578,19 +578,19 @@ class OptimizationRecorder:
 
     Pass an instance as the ``callback`` to ``LevenbergMarquardt.run`` (the LM
     engine calls ``callback(state)`` after every accepted step). Afterwards, the
-    recorded thetas can be replayed through the lens to visualize how the spot /
+    recorded thetas can be replayed through the optics to visualize how the spot /
     layout evolved -- without re-running the optimization.
 
     Usage
     -----
-        rec = OptimizationRecorder(lens)
+        rec = OptimizationRecorder(optics)
         lm.run(40, callback=rec)
-        viz.plot_spot_evolution(lens, rec)
+        viz.plot_spot_evolution(optics, rec)
     """
-    def __init__(self, lens, stride: int = 1):
-        self.lens = lens
+    def __init__(self, optics, stride: int = 1):
+        self.optics = optics
         self.stride = int(stride)
-        self.thetas: List[torch.Tensor] = [lens.get_theta().clone()]
+        self.thetas: List[torch.Tensor] = [optics.get_theta().clone()]
         self.losses: List[float] = []
         self._i = 0
 
@@ -610,7 +610,7 @@ class OptimizationRecorder:
         return len(self.thetas)
 
 
-def _spot_at(lens, theta, wavelength_index=0, field_index=None):
+def _spot_at(optics, theta, wavelength_index=0, field_index=None):
     """Spot points (um, centroid-referenced) at one design state.
 
     ``field_index=None`` picks the currently worst field, which is what a
@@ -623,20 +623,20 @@ def _spot_at(lens, theta, wavelength_index=0, field_index=None):
     whole-design effective spot radius and ``rms_um`` is the RMS radius of the
     field actually plotted.
     """
-    saved = lens.get_theta().clone()
-    lens.set_theta(theta)
-    sp = lens.forward()
+    saved = optics.get_theta().clone()
+    optics.set_theta(theta)
+    sp = optics.forward()
     esr = float(sp.effective_spot_radius()) * 1000
     rms_all = sp.rms_radius()
     fi = int(torch.argmax(rms_all)) if field_index is None else int(field_index)
     m = sp.valid[fi, wavelength_index]
     pts = ((sp.xy[fi, wavelength_index][m] - sp.centroids()[fi]) * 1000.0).detach().numpy()
     rms = float(rms_all[fi]) * 1000
-    lens.set_theta(saved)
+    optics.set_theta(saved)
     return pts, esr, fi, rms
 
 
-def plot_spot_evolution(lens, recorder, n_show: int = 6, view_um: Optional[float] = None,
+def plot_spot_evolution(optics, recorder, n_show: int = 6, view_um: Optional[float] = None,
                         fields: Optional[Sequence[int]] = None,
                         share_view: bool = False,
                         style: Optional[VizStyle] = None):
@@ -664,14 +664,14 @@ def plot_spot_evolution(lens, recorder, n_show: int = 6, view_um: Optional[float
     st = _S(style)
     idx = np.linspace(0, recorder.n_frames - 1, min(n_show, recorder.n_frames))
     idx = sorted(set(int(round(i)) for i in idx))
-    F = lens.fields_deg.numel()
+    F = optics.fields_deg.numel()
     fld = list(range(F)) if fields is None else [int(f) for f in fields]
 
     # collect first so the view boxes can be derived from the real extents
     data = {}
     for fi in fld:
         for k in idx:
-            data[(fi, k)] = _spot_at(lens, recorder.thetas[k], field_index=fi)
+            data[(fi, k)] = _spot_at(optics, recorder.thetas[k], field_index=fi)
 
     # A converging run shrinks the spot by one to two orders of magnitude, so a
     # single box across a row renders the converged panels as one dot. Each panel
@@ -721,7 +721,7 @@ def plot_spot_evolution(lens, recorder, n_show: int = 6, view_um: Optional[float
                         ha="center", va="bottom", fontsize=st.label_size - 1,
                         color="0.45", fontfamily=st.font_family)
             if col == 0:
-                ax.text(-0.16, 0.5, f"{float(lens.fields_deg[fi]):.0f}\u00b0 field",
+                ax.text(-0.16, 0.5, f"{float(optics.fields_deg[fi]):.0f}\u00b0 field",
                         transform=ax.transAxes, ha="right", va="center",
                         rotation=90, fontsize=st.label_size + 1,
                         color=st.color(fi), fontfamily=st.font_family)
@@ -734,7 +734,7 @@ def plot_spot_evolution(lens, recorder, n_show: int = 6, view_um: Optional[float
     return fig
 
 
-def plot_field_convergence(lens, recorder, fields: Optional[Sequence[int]] = None,
+def plot_field_convergence(optics, recorder, fields: Optional[Sequence[int]] = None,
                            style: Optional[VizStyle] = None):
     """Per-field RMS spot radius vs LM iteration, log scale.
 
@@ -746,29 +746,29 @@ def plot_field_convergence(lens, recorder, fields: Optional[Sequence[int]] = Non
     visible as two curves swapping order.
     """
     st = _S(style)
-    F = lens.fields_deg.numel()
+    F = optics.fields_deg.numel()
     fld = list(range(F)) if fields is None else [int(f) for f in fields]
-    saved = lens.get_theta().clone()
+    saved = optics.get_theta().clone()
     iters = list(range(recorder.n_frames))
     rms = np.zeros((len(fld), len(iters)))
     esr = np.zeros(len(iters))
     worst = np.zeros(len(iters), dtype=int)
     for j, k in enumerate(iters):
-        lens.set_theta(recorder.thetas[k])
-        sp = lens.forward()
+        optics.set_theta(recorder.thetas[k])
+        sp = optics.forward()
         r = sp.rms_radius()
         for i, fi in enumerate(fld):
             rms[i, j] = float(r[fi]) * 1000
         esr[j] = float(sp.effective_spot_radius()) * 1000
         worst[j] = int(torch.argmax(r))
-    lens.set_theta(saved)
+    optics.set_theta(saved)
 
     fig, ax = _fig(w=6.4, h=4.0, style=st)
     ax.plot(iters, esr, color="0.55", lw=2.6, ls="--", zorder=1,
             label="ESR (design-wide = mean over fields)")
     for i, fi in enumerate(fld):
         ax.plot(iters, rms[i], color=st.color(fi), lw=1.9, zorder=2,
-                label=f"{float(lens.fields_deg[fi]):.0f}\u00b0 field")
+                label=f"{float(optics.fields_deg[fi]):.0f}\u00b0 field")
     # mark where the limiting field changes hands
     sw = [k for k in iters[1:] if worst[k] != worst[k - 1]]
     for k in sw:
@@ -792,7 +792,7 @@ def plot_field_convergence(lens, recorder, fields: Optional[Sequence[int]] = Non
     return fig
 
 
-def animate_spot_evolution(lens, recorder, path: str = "spot_evolution.gif",
+def animate_spot_evolution(optics, recorder, path: str = "spot_evolution.gif",
                            fps: int = 6, view_um: Optional[float] = None,
                            fields: Optional[Sequence[int]] = None,
                            style: Optional[VizStyle] = None):
@@ -806,7 +806,7 @@ def animate_spot_evolution(lens, recorder, path: str = "spot_evolution.gif",
     """
     from matplotlib.animation import FuncAnimation, PillowWriter
     st = _S(style)
-    F = lens.fields_deg.numel()
+    F = optics.fields_deg.numel()
     fld = list(range(F)) if fields is None else [int(f) for f in fields]
     # One panel per field, all sharing a FIXED box taken from the largest spot in
     # the whole recording. A per-frame box would rescale away the very shrinkage
@@ -814,7 +814,7 @@ def animate_spot_evolution(lens, recorder, path: str = "spot_evolution.gif",
     # which field it displays mid-run.
     if view_um is None:
         view_um = 1.0 + 1.15 * max(
-            float(np.abs(_spot_at(lens, recorder.thetas[k], field_index=fi)[0]).max())
+            float(np.abs(_spot_at(optics, recorder.thetas[k], field_index=fi)[0]).max())
             for fi in fld for k in (0, recorder.n_frames - 1))
     fig, axs = _fig(1, len(fld), w=2.7, h=2.9, style=st)
     axs = np.atleast_1d(axs).ravel()
@@ -826,7 +826,7 @@ def animate_spot_evolution(lens, recorder, path: str = "spot_evolution.gif",
         if fi == fld[0]:
             ax.set_ylabel("y (\u00b5m)")
         ttls.append(ax.set_title(""))
-        ax.text(0.02, 0.97, f"{float(lens.fields_deg[fi]):.0f}\u00b0",
+        ax.text(0.02, 0.97, f"{float(optics.fields_deg[fi]):.0f}\u00b0",
                 transform=ax.transAxes, ha="left", va="top",
                 fontsize=st.label_size, color=st.color(fi),
                 fontfamily=st.font_family)
@@ -837,7 +837,7 @@ def animate_spot_evolution(lens, recorder, path: str = "spot_evolution.gif",
 
     def _update(k):
         for sc, ttl, fi in zip(scs, ttls, fld):
-            pts, esr, _, rms = _spot_at(lens, recorder.thetas[k], field_index=fi)
+            pts, esr, _, rms = _spot_at(optics, recorder.thetas[k], field_index=fi)
             sc.set_offsets(pts if len(pts) else np.zeros((0, 2)))
             ttl.set_text(f"RMS {rms:.1f} \u00b5m")
         sup.set_text(f"iteration {k}    ESR {esr:.1f} \u00b5m")
@@ -847,3 +847,8 @@ def animate_spot_evolution(lens, recorder, path: str = "spot_evolution.gif",
     anim.save(path, writer=PillowWriter(fps=fps))
     plt.close(fig)
     return path
+
+
+# --- Backward-compatible aliases (see optics/__init__.py) -----------------
+plot_lens_layout = plot_layout
+compare_lenses = compare_designs

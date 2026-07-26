@@ -7,7 +7,7 @@ small so the toy end-to-end demo trains in seconds on CPU. Swap it for any
 ``BaseRestoration`` -- NAFNet, Restormer, a Wiener+U-Net sandwich, etc.
 
 The IRM is a ``torch.nn.Module`` and its parameters are optimized by Adam in the
-joint loop's algorithm step, while the lens parameters are frozen; the lens step
+joint loop's algorithm step, while the optics parameters are frozen; the optics step
 does the reverse (Supp. S3.3.1).
 
 Wiener stub: ``WienerDeconv`` documents the learnable-SNR Wiener front-end that

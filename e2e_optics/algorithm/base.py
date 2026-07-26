@@ -11,7 +11,7 @@ Image-driven design (Cote et al. 2026, sec. 4) is the special case where the
 IRM is the identity -- the optics alone must produce a good image. That is the
 Fig. 4 toy problem, provided by ``IdentityRestoration``.
 
-The IRM is optimized with Adam (backward-mode AD), independently of the lens,
+The IRM is optimized with Adam (backward-mode AD), independently of the optics,
 in the alternating joint loop.
 """
 from __future__ import annotations

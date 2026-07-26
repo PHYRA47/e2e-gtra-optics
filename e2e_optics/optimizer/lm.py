@@ -15,7 +15,7 @@ with the paper's stabilizations (Supp. S2.3.2):
     Rejected steps are undone; this makes the convergence curve monotonic.
 
 The Jacobian J = d l / d theta is computed with FORWARD-mode AD
-(torch.func.jacfwd), whose cost scales with N (few lens variables), not M
+(torch.func.jacfwd), whose cost scales with N (few optics variables), not M
 (thousands of residuals). For GTRA, the residual function passed here should
 close over the (constant) weight w and target eps', so that J is effectively
 sqrt(w) * d(spot diagram)/d theta -- the ray-tracer Jacobian only.

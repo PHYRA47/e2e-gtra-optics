@@ -12,9 +12,9 @@ no separate penalty schedule, no projection step, and the Jacobian rows for
 inactive constraints are simply zero.
 
 Every quantity here comes from the "rays as probes" trace
-(``lens._trace_packed(..., probes=True)``): the ray-marching distances and angles
+(``optics._trace_packed(..., probes=True)``): the ray-marching distances and angles
 that the spot-diagram trace already computes are reused as constraint operands,
-rather than re-deriving lens geometry analytically.
+rather than re-deriving optics geometry analytically.
 
 Implemented
 -----------
@@ -80,7 +80,7 @@ def ray_path_residuals(probes: dict,
 
     Parameters
     ----------
-    probes : dict from ``lens._trace_packed(..., probes=True)``; uses ``tz``
+    probes : dict from ``optics._trace_packed(..., probes=True)``; uses ``tz``
         of shape (n_spacings, F, W, P).
     tz_min, tz_max : per-spacing lower/upper bounds in mm, or a scalar applied to
         every spacing. A lower bound of at least 0 everywhere prevents
@@ -152,7 +152,7 @@ def geometric_residuals(probes: dict,
     LM::
 
         def residuals(theta):
-            xy, _, pk = lens._trace_packed(pack(theta), probes=True)
+            xy, _, pk = optics._trace_packed(pack(theta), probes=True)
             return torch.cat([tra_residuals(xy),
                               geometric_residuals(pk, tz_min=..., tz_max=...)])
 
@@ -200,8 +200,8 @@ class GeometricConstraints:
 
     Example
     -------
-    >>> gc = GeometricConstraints.from_optics(lens)   # labels read off the lens
-    >>> resid_geo = gc(lens.ray_probes())
+    >>> gc = GeometricConstraints.from_optics(optics)   # labels read off the optics
+    >>> resid_geo = gc(optics.ray_probes())
     """
 
     def __init__(self, spacing_kinds: Sequence[str],
@@ -230,8 +230,8 @@ class GeometricConstraints:
     def from_optics(cls, optics, **kw):
         """Build with the spacing kinds read off the optics (recommended).
 
-        >>> gc = GeometricConstraints.from_optics(lens)      # paper defaults
-        >>> gc = GeometricConstraints.from_optics(lens, min_glass=0.4)
+        >>> gc = GeometricConstraints.from_optics(optics)      # paper defaults
+        >>> gc = GeometricConstraints.from_optics(optics, min_glass=0.4)
         """
         return cls(spacing_kinds_from_optics(optics), **kw)
 

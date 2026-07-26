@@ -24,7 +24,7 @@ Numerical care taken:
   * refraction clamps the TIR discriminant and reports a validity mask.
 
 Vignetting / ray-aiming and diffractive (DOE) surfaces are stubbed with clear
-hooks -- see ``diffract`` and ``RotationallySymmetricLens.aim_rays``.
+hooks -- see ``diffract`` and ``RotationallySymmetricOptics.aim_rays``.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -189,10 +189,10 @@ def concentric_pupil(n_rings: int, jitter: bool = True,
 
 
 # ----------------------------------------------------------------------------
-# The lens
+# The optics
 # ----------------------------------------------------------------------------
-class RotationallySymmetricLens(BaseOptics):
-    """Sequential rotationally-symmetric aspheric lens (all-refractive)."""
+class RotationallySymmetricOptics(BaseOptics):
+    """Sequential rotationally-symmetric aspheric optics (all-refractive)."""
 
     def __init__(self,
                  surfaces: List[Surface],
@@ -580,7 +580,7 @@ class RotationallySymmetricLens(BaseOptics):
         """Vignetting factor estimation + iterative ray aiming (Supp. S1.3.2).
 
         STUB. v1 assumes the stop is at the front (pupil == surface 0) with no
-        vignetting, which is exact for the front-stop toy lens. For internal
+        vignetting, which is exact for the front-stop toy optics. For internal
         stops / mechanical vignetting, implement the three vignetting factors
         and the linearized aiming of Eqs. S19-S22 here.
         """
