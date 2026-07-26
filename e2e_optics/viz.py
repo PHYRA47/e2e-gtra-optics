@@ -610,67 +610,238 @@ class OptimizationRecorder:
         return len(self.thetas)
 
 
-def _spot_at(lens, theta, wavelength_index=0):
+def _spot_at(lens, theta, wavelength_index=0, field_index=None):
+    """Spot points (um, centroid-referenced) at one design state.
+
+    ``field_index=None`` picks the currently worst field, which is what a
+    single-panel summary wants. Pass an explicit index to follow ONE fixed field
+    across iterations: the worst field is not the same field throughout an
+    optimization run, so a sequence of worst-field panels silently changes
+    subject partway through and cannot be read as one field improving.
+
+    Returns ``(pts, esr_um, field_index, rms_um)`` where ``esr_um`` is the
+    whole-design effective spot radius and ``rms_um`` is the RMS radius of the
+    field actually plotted.
+    """
     saved = lens.get_theta().clone()
     lens.set_theta(theta)
     sp = lens.forward()
     esr = float(sp.effective_spot_radius()) * 1000
-    fi = int(torch.argmax(sp.rms_radius()))
+    rms_all = sp.rms_radius()
+    fi = int(torch.argmax(rms_all)) if field_index is None else int(field_index)
     m = sp.valid[fi, wavelength_index]
     pts = ((sp.xy[fi, wavelength_index][m] - sp.centroids()[fi]) * 1000.0).detach().numpy()
+    rms = float(rms_all[fi]) * 1000
     lens.set_theta(saved)
-    return pts, esr, fi
+    return pts, esr, fi, rms
 
 
 def plot_spot_evolution(lens, recorder, n_show: int = 6, view_um: Optional[float] = None,
+                        fields: Optional[Sequence[int]] = None,
+                        share_view: bool = False,
                         style: Optional[VizStyle] = None):
-    """Grid of worst-field spot diagrams sampled across the optimization."""
+    """Spot-diagram evolution as a fields x iterations grid.
+
+    One ROW per field angle, one COLUMN per sampled iteration, so each row is one
+    fixed field improving and can be read straight across. Previously this drew a
+    single row of *worst-field* spots, which changes which field it shows partway
+    through a run (on the toy: field 2 at iteration 0, field 1 from iteration 3
+    on), making the panels look like a discontinuous jump that is really a change
+    of subject.
+
+    Parameters
+    ----------
+    n_show     : number of iterations to sample across the recording
+    fields     : field indices to show (default: all)
+    view_um    : half-width of the plotted box in um, applied to every panel.
+                 Default None autoscales per panel (see ``share_view``).
+    share_view : if True, EVERY panel uses one box sized to the largest spot in
+                 the grid. Honest but usually unreadable: a converging run shrinks
+                 the spot 10-100x, so the converged panels collapse to a single
+                 dot. Default False autoscales each panel and prints its box
+                 half-width, so structure stays visible and the scale is stated.
+    """
     st = _S(style)
     idx = np.linspace(0, recorder.n_frames - 1, min(n_show, recorder.n_frames))
     idx = sorted(set(int(round(i)) for i in idx))
-    fig, axs = _fig(1, len(idx), w=2.2, h=2.5, style=st)
-    if len(idx) == 1:
-        axs = [axs]
-    for ax, k in zip(axs, idx):
-        pts, esr, fi = _spot_at(lens, recorder.thetas[k])
-        ax.scatter(pts[:, 0], pts[:, 1], s=3, color=st.color(fi),
-                   alpha=0.6, edgecolors='none')
-        ax.set_aspect('equal')
-        ax.set_title(f"it {k}\nESR {esr:.0f} \u00b5m")
-        ax.set_xticks([]); ax.set_yticks([])
-        if view_um:
-            ax.set_xlim(-view_um, view_um); ax.set_ylim(-view_um, view_um)
-    fig.suptitle("Spot evolution during optimization", fontsize=st.title_size,
+    F = lens.fields_deg.numel()
+    fld = list(range(F)) if fields is None else [int(f) for f in fields]
+
+    # collect first so the view boxes can be derived from the real extents
+    data = {}
+    for fi in fld:
+        for k in idx:
+            data[(fi, k)] = _spot_at(lens, recorder.thetas[k], field_index=fi)
+
+    # A converging run shrinks the spot by one to two orders of magnitude, so a
+    # single box across a row renders the converged panels as one dot. Each panel
+    # therefore gets its own box (spot STRUCTURE stays visible throughout) and the
+    # box half-width is printed under the panel, so the shrinkage is read from the
+    # numbers rather than being faked by a shared axis. Pass an explicit
+    # ``view_um`` (or share_view=True) for a genuinely fixed box when the run
+    # spans a narrow range.
+    if view_um is not None:
+        box = {key: float(view_um) for key in data}
+    elif share_view:
+        v = max(float(np.abs(d[0]).max()) for d in data.values()) * 1.15 + 1.0
+        box = {key: v for key in data}
+    else:
+        box = {key: float(np.abs(d[0]).max()) * 1.25 + 0.5 for key, d in data.items()}
+
+    fig, axs = _fig(len(fld), len(idx), w=1.95, h=2.35, style=st)
+    axs = np.atleast_2d(axs).reshape(len(fld), len(idx))
+    for row, fi in enumerate(fld):
+        for col, k in enumerate(idx):
+            ax = axs[row, col]
+            pts, esr, _, rms = data[(fi, k)]
+            ax.scatter(pts[:, 0], pts[:, 1], s=3, color=st.color(fi),
+                       alpha=0.6, edgecolors='none')
+            v = box[(fi, k)]
+            ax.set_xlim(-v, v); ax.set_ylim(-v, v)
+            ax.set_aspect('equal')
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_color("0.6")
+            # per-panel RMS (this field, this iteration) inside the axes so it
+            # cannot collide with the row below; box half-width underneath, since
+            # the box is no longer constant
+            # both annotations live INSIDE the axes: an outside label would
+            # collide with the row above once every panel has its own box label
+            ax.text(0.04, 0.965, f"RMS {rms:.1f} \u00b5m", transform=ax.transAxes,
+                    ha="left", va="top", fontsize=st.label_size - 1,
+                    color=st.color(fi), fontfamily=st.font_family)
+            ax.text(0.96, 0.035, f"\u00b1{v:.0f} \u00b5m", transform=ax.transAxes,
+                    ha="right", va="bottom", fontsize=st.label_size - 2,
+                    color="0.45", fontfamily=st.font_family)
+            if row == 0:
+                ax.text(0.5, 1.22, f"iteration {k}", transform=ax.transAxes,
+                        ha="center", va="bottom", fontsize=st.label_size + 1,
+                        color=st.font_color, fontfamily=st.font_family)
+                ax.text(0.5, 1.135, f"ESR {esr:.0f} \u00b5m", transform=ax.transAxes,
+                        ha="center", va="bottom", fontsize=st.label_size - 1,
+                        color="0.45", fontfamily=st.font_family)
+            if col == 0:
+                ax.text(-0.16, 0.5, f"{float(lens.fields_deg[fi]):.0f}\u00b0 field",
+                        transform=ax.transAxes, ha="right", va="center",
+                        rotation=90, fontsize=st.label_size + 1,
+                        color=st.color(fi), fontfamily=st.font_family)
+
+    fig.suptitle("Spot evolution during optimization \u2014 one row per field "
+                 "(each panel autoscaled; box half-width printed)",
+                 fontsize=st.title_size, color=st.font_color,
+                 fontfamily=st.font_family)
+    fig.tight_layout(rect=(0, 0.01, 1, 0.93 if len(fld) > 1 else 0.86))
+    return fig
+
+
+def plot_field_convergence(lens, recorder, fields: Optional[Sequence[int]] = None,
+                           style: Optional[VizStyle] = None):
+    """Per-field RMS spot radius vs LM iteration, log scale.
+
+    The quantitative companion to :func:`plot_spot_evolution`. The design-wide
+    effective spot radius is the MEAN of the per-field RMS radii
+    (``rms_radius().mean()``), so it sits between the best and worst field and
+    hides which field is actually limiting the design -- and which field that is
+    changes during the run. Dotted lines mark those handovers; the crossover is
+    visible as two curves swapping order.
+    """
+    st = _S(style)
+    F = lens.fields_deg.numel()
+    fld = list(range(F)) if fields is None else [int(f) for f in fields]
+    saved = lens.get_theta().clone()
+    iters = list(range(recorder.n_frames))
+    rms = np.zeros((len(fld), len(iters)))
+    esr = np.zeros(len(iters))
+    worst = np.zeros(len(iters), dtype=int)
+    for j, k in enumerate(iters):
+        lens.set_theta(recorder.thetas[k])
+        sp = lens.forward()
+        r = sp.rms_radius()
+        for i, fi in enumerate(fld):
+            rms[i, j] = float(r[fi]) * 1000
+        esr[j] = float(sp.effective_spot_radius()) * 1000
+        worst[j] = int(torch.argmax(r))
+    lens.set_theta(saved)
+
+    fig, ax = _fig(w=6.4, h=4.0, style=st)
+    ax.plot(iters, esr, color="0.55", lw=2.6, ls="--", zorder=1,
+            label="ESR (design-wide = mean over fields)")
+    for i, fi in enumerate(fld):
+        ax.plot(iters, rms[i], color=st.color(fi), lw=1.9, zorder=2,
+                label=f"{float(lens.fields_deg[fi]):.0f}\u00b0 field")
+    # mark where the limiting field changes hands
+    sw = [k for k in iters[1:] if worst[k] != worst[k - 1]]
+    for k in sw:
+        ax.axvline(k, color="#b2182b", lw=0.9, ls=":", zorder=0)
+    if sw:
+        lab = (f"limiting field changes hands (it {sw[0]}"
+               + (f"\u2013{sw[-1]}, {len(sw)}\u00d7)" if len(sw) > 1 else ")"))
+        ax.annotate(lab, xy=(sw[0], rms.max()), xycoords="data",
+                    xytext=(8, -14), textcoords="offset points",
+                    ha="left", va="top", fontsize=st.label_size - 1,
+                    color="#b2182b", fontfamily=st.font_family)
+    ax.set_yscale("log")
+    ax.set_xlabel("LM iteration", fontsize=st.label_size, color=st.font_color)
+    ax.set_ylabel("RMS spot radius (\u00b5m)", fontsize=st.label_size,
+                  color=st.font_color)
+    ax.set_title("Per-field convergence", fontsize=st.title_size,
                  color=st.font_color, fontfamily=st.font_family)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    ax.grid(True, which="both", alpha=0.25, lw=0.5)
+    ax.legend(fontsize=st.label_size - 1, frameon=False)
+    fig.tight_layout()
     return fig
 
 
 def animate_spot_evolution(lens, recorder, path: str = "spot_evolution.gif",
                            fps: int = 6, view_um: Optional[float] = None,
+                           fields: Optional[Sequence[int]] = None,
                            style: Optional[VizStyle] = None):
-    """Write a GIF of the worst-field spot shrinking over iterations.
+    """Write a GIF of the spot shrinking over iterations, one panel per field.
+
+    Every panel shares one fixed view box derived from the whole recording, so
+    the shrinkage is actually visible rather than rescaled away frame by frame.
+    ``fields`` selects which field angles to animate (default: all).
 
     Requires pillow (already a dependency). Returns the output path.
     """
     from matplotlib.animation import FuncAnimation, PillowWriter
     st = _S(style)
-    # fix a common view box from the first frame if none given
+    F = lens.fields_deg.numel()
+    fld = list(range(F)) if fields is None else [int(f) for f in fields]
+    # One panel per field, all sharing a FIXED box taken from the largest spot in
+    # the whole recording. A per-frame box would rescale away the very shrinkage
+    # the animation exists to show, and a single worst-field panel would swap
+    # which field it displays mid-run.
     if view_um is None:
-        pts0, _, _ = _spot_at(lens, recorder.thetas[0])
-        view_um = float(np.abs(pts0).max()) * 1.1 + 1.0
-    fig, ax = _fig(w=3.4, h=3.4, style=st)
-    sc = ax.scatter([], [], s=4, color=st.color(0), alpha=0.6, edgecolors='none')
-    ax.set_xlim(-view_um, view_um); ax.set_ylim(-view_um, view_um)
-    ax.set_aspect('equal'); ax.set_xlabel("x (\u00b5m)"); ax.set_ylabel("y (\u00b5m)")
-    ttl = ax.set_title("")
+        view_um = 1.0 + 1.15 * max(
+            float(np.abs(_spot_at(lens, recorder.thetas[k], field_index=fi)[0]).max())
+            for fi in fld for k in (0, recorder.n_frames - 1))
+    fig, axs = _fig(1, len(fld), w=2.7, h=2.9, style=st)
+    axs = np.atleast_1d(axs).ravel()
+    scs, ttls = [], []
+    for ax, fi in zip(axs, fld):
+        sc = ax.scatter([], [], s=4, color=st.color(fi), alpha=0.6, edgecolors='none')
+        ax.set_xlim(-view_um, view_um); ax.set_ylim(-view_um, view_um)
+        ax.set_aspect('equal'); ax.set_xlabel("x (\u00b5m)")
+        if fi == fld[0]:
+            ax.set_ylabel("y (\u00b5m)")
+        ttls.append(ax.set_title(""))
+        ax.text(0.02, 0.97, f"{float(lens.fields_deg[fi]):.0f}\u00b0",
+                transform=ax.transAxes, ha="left", va="top",
+                fontsize=st.label_size, color=st.color(fi),
+                fontfamily=st.font_family)
+        scs.append(sc)
+    sup = fig.suptitle("", fontsize=st.title_size, color=st.font_color,
+                       fontfamily=st.font_family)
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
 
     def _update(k):
-        pts, esr, fi = _spot_at(lens, recorder.thetas[k])
-        sc.set_offsets(pts)
-        sc.set_color(st.color(fi))
-        ttl.set_text(f"iteration {k}    ESR {esr:.1f} \u00b5m")
-        return sc, ttl
+        for sc, ttl, fi in zip(scs, ttls, fld):
+            pts, esr, _, rms = _spot_at(lens, recorder.thetas[k], field_index=fi)
+            sc.set_offsets(pts if len(pts) else np.zeros((0, 2)))
+            ttl.set_text(f"RMS {rms:.1f} \u00b5m")
+        sup.set_text(f"iteration {k}    ESR {esr:.1f} \u00b5m")
+        return (*scs, *ttls, sup)
 
     anim = FuncAnimation(fig, _update, frames=recorder.n_frames, blit=False)
     anim.save(path, writer=PillowWriter(fps=fps))

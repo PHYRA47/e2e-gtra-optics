@@ -398,6 +398,74 @@ def test_constraints_rescue_a_violating_design():
     assert (tz_free != tz_free) or abs(tz_free - 0.25) > abs(tz_con - 0.25)
 
 
+# ---------------------------------------------------------------------------
+# Spot-evolution visualization: one fixed field per row
+# ---------------------------------------------------------------------------
+def test_spot_at_field_selection_is_explicit():
+    """field_index=None follows the worst field; an int pins one fixed field."""
+    from e2e_optics import viz as _V
+    lens = _toy_derived(rings=4, fields=(0.0, 15.0, 30.0))
+    th = lens.get_theta().clone()
+    _, _, fi_auto, _ = _V._spot_at(lens, th)                      # worst field
+    for want in range(lens.fields_deg.numel()):
+        _, _, got, rms = _V._spot_at(lens, th, field_index=want)
+        assert got == want, f"asked for field {want}, plotted {got}"
+        assert rms > 0.0
+    # the automatic choice must really be the largest RMS field
+    r = lens.forward().rms_radius()
+    assert fi_auto == int(torch.argmax(r))
+
+
+def test_worst_field_changes_during_a_run():
+    """The defect the per-field grid fixes: the worst field is not one field.
+
+    If this ever stops holding for the toy the grid is still correct, but the
+    single-row worst-field plot would no longer be actively misleading -- so the
+    test documents WHY the layout changed rather than asserting cosmetics.
+    """
+    from e2e_optics import viz as _V
+    lens = _toy_derived(rings=4, fields=(0.0, 15.0, 30.0))
+    F = lens.fields_deg.numel(); W = lens.wavelengths_um.numel()
+    P = lens.pupil.shape[0]
+
+    def resid(t):
+        xy = lens.spot_from_theta(t).reshape(F, W, P, 2)
+        c = xy.mean(dim=(1, 2), keepdim=True)
+        return ((xy - c) / (F * W * P) ** 0.5).reshape(-1)
+
+    recorder = _V.OptimizationRecorder(lens)
+    LevenbergMarquardt(resid, lens.get_theta(), lam0=1.0).run(25, callback=recorder)
+    worst = [_V._spot_at(lens, recorder.thetas[k])[2] for k in range(recorder.n_frames)]
+    assert len(set(worst)) > 1, "expected the limiting field to change hands"
+
+
+def test_evolution_grid_has_one_row_per_field():
+    from e2e_optics import viz as _V
+    lens = _toy_derived(rings=4, fields=(0.0, 20.0))
+    recorder = _V.OptimizationRecorder(lens)
+    recorder(lens.get_theta())          # recorder accepts a bare tensor
+    fig = _V.plot_spot_evolution(lens, recorder, n_show=2)
+    # 2 fields x 2 iterations
+    assert len(fig.axes) == 4, f"expected a 2x2 grid, got {len(fig.axes)} axes"
+    fig2 = _V.plot_spot_evolution(lens, recorder, n_show=2, fields=[1])
+    assert len(fig2.axes) == 2
+    _V.plt.close(fig); _V.plt.close(fig2)
+
+
+def test_field_convergence_curve_covers_every_field():
+    from e2e_optics import viz as _V
+    lens = _toy_derived(rings=4, fields=(0.0, 20.0))
+    recorder = _V.OptimizationRecorder(lens)
+    for _ in range(3):
+        recorder(lens.get_theta())
+    fig = _V.plot_field_convergence(lens, recorder)
+    ax = fig.axes[0]
+    # one line per field plus the design-wide ESR curve
+    assert len(ax.lines) >= lens.fields_deg.numel() + 1
+    assert ax.get_yscale() == "log"
+    _V.plt.close(fig)
+
+
 def test_distortion_residuals_is_an_honest_stub():
     try:
         _C.distortion_residuals()
