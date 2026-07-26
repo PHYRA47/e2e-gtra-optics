@@ -272,6 +272,13 @@ equation-to-code cross-reference, and the extension guide (diffraction
 compensation, ray aiming, dispersion, spatially-varying convolution, NAFNet+Wiener
 IRM — all present as documented stubs).
 
+`docs/WORK_REPORT.md` is the build narrative: what was implemented, the defects
+found while validating the figures (stale apertures, a ray fan wider than the
+pupil, invented ray intersections, mislabelled statistics) and how each was
+fixed, the measured results on the toy, and the open question about the joint
+stage. `docs/semi_apertures.md` covers why element apertures are derived rather
+than declared.
+
 ---
 
 ## Scope of v1
