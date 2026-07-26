@@ -71,10 +71,15 @@ def mse(a, b):
 # --------------------------------------------------------------------------- #
 def build_toy(rings: int = 8, fields=(0.0, 15.0, 30.0)) -> RotationallySymmetricOptics:
     surfaces = [
-        Surface(1 / 5.0,   0.0, [0., 0., 0.], 2.2, N_GLASS, True,  2.6),
-        Surface(-1 / 18.0, 0.0, [0., 0., 0.], 2.0, 1.0,     False, 2.8),
-        Surface(1 / 9.0,   0.0, [0., 0., 0.], 2.2, N_GLASS, False, 3.4),
-        Surface(-1 / 9.0,  0.0, [0., 0., 0.], 2.1, 1.0,     False, 3.8),
+        # semi_aperture left as None => DERIVED from the ray footprint. Declaring
+        # it here would go stale the moment LM moves thickness/curvature: at the
+        # TRA optimum this design needs 4.5 mm on the rear element where the old
+        # hand-typed 3.8 mm would still be drawn, so the layout showed rays
+        # passing outside the glass they refract at.
+        Surface(1 / 5.0,   0.0, [0., 0., 0.], 2.2, N_GLASS, True),
+        Surface(-1 / 18.0, 0.0, [0., 0., 0.], 2.0, 1.0,     False),
+        Surface(1 / 9.0,   0.0, [0., 0., 0.], 2.2, N_GLASS, False),
+        Surface(-1 / 9.0,  0.0, [0., 0., 0.], 2.1, 1.0,     False),
     ]
     return RotationallySymmetricOptics(
         surfaces, epd=5.0, fields_deg=list(fields), wavelengths_um=[0.5876],
@@ -106,13 +111,13 @@ def main(outdir: str = "."):
     # 1. STARTING DESIGN --------------------------------------------------
     optics = build_toy()
     esr_start = optics.forward().effective_spot_radius().item() * 1000
-    print(f"[1] starting design      ESR = {esr_start:6.1f} um")
+    print(f"[1] starting design      ESR = {esr_start:7.2f} um")
 
     # 2. CONVENTIONAL TRA-LM ---------------------------------------------
     tra_hist = optimize_tra(optics, 40)
     esr_tra = optics.forward().effective_spot_radius().item() * 1000
     theta_tra = optics.get_theta().clone()
-    print(f"[2] TRA-LM (min-spot)    ESR = {esr_tra:6.1f} um  "
+    print(f"[2] TRA-LM (min-spot)    ESR = {esr_tra:7.2f} um  "
           f"(merit {tra_hist[0]:.2e} -> {tra_hist[-1]:.2e})")
 
     # imaging model at paper-like pixel scale (spot ~ 1.8 px -> mild blur)
@@ -133,13 +138,21 @@ def main(outdir: str = "."):
                                        algo_step=True, optics_step=True))
     jhist = joint.run(30)
     esr_e2e = optics.forward().effective_spot_radius().item() * 1000
+    # The joint stage moves the optics only slightly here: the TRA design is
+    # already near the spot-metric optimum, so most of the task-loss reduction
+    # is absorbed by the network. Report the parameter delta so "the optics
+    # barely moved" is visible rather than something the reader must infer
+    # from an ESR that rounds to the same value.
+    dtheta = (optics.get_theta().detach() - theta_tra).abs().max().item()
     restored = net.restore(bridge.simulate(optics.forward(), scene, add_noise=True))
-    print(f"[3] end-to-end (GTRA+Adam) ESR = {esr_e2e:6.1f} um  "
+    print(f"[3] end-to-end (GTRA+Adam) ESR = {esr_e2e:7.2f} um  "
           f"restored PSNR = {psnr(restored, scene):5.2f} dB")
+    print(f"    joint stage moved optics by max|d(theta)| = {dtheta:.2e}")
 
     _figures(outdir, scene, cap_blur, restored, tra_hist, jhist,
              esr_start, esr_tra, esr_e2e)
     return dict(esr_start=esr_start, esr_tra=esr_tra, esr_e2e=esr_e2e,
+                joint_dtheta=dtheta,
                 blur_psnr=psnr(cap_blur, scene), restored_psnr=psnr(restored, scene))
 
 
@@ -174,4 +187,4 @@ def _figures(outdir, scene, blurred, restored, tra_hist, jhist,
 
 if __name__ == "__main__":
     stats = main(".")
-    print("\nsummary:", {k: round(v, 2) for k, v in stats.items()})
+    print("\nsummary:", {k: f"{v:.4g}" for k, v in stats.items()})

@@ -58,10 +58,11 @@ def build_toy(chromatic: bool, rings: int = 8):
     wl = [0.4861, 0.5876, 0.6563] if chromatic else [0.5876]
     S = Surface
     surfaces = [
-        S(1 / 5.0,   0.0, [0., 0., 0.], 2.2, N_BK7, True,  2.6, V_BK7),
-        S(-1 / 18.0, 0.0, [0., 0., 0.], 2.0, 1.0,   False, 2.8),
-        S(1 / 9.0,   0.0, [0., 0., 0.], 2.2, N_BK7, False, 3.4, V_BK7),
-        S(-1 / 9.0,  0.0, [0., 0., 0.], 2.1, 1.0,   False, 3.8),
+        # semi_aperture=None => derived from the ray footprint (see demo comment)
+        S(1 / 5.0,   0.0, [0., 0., 0.], 2.2, N_BK7, True,  None, V_BK7),
+        S(-1 / 18.0, 0.0, [0., 0., 0.], 2.0, 1.0,   False, None),
+        S(1 / 9.0,   0.0, [0., 0., 0.], 2.2, N_BK7, False, None, V_BK7),
+        S(-1 / 9.0,  0.0, [0., 0., 0.], 2.1, 1.0,   False, None),
     ]
     return RotationallySymmetricOptics(
         surfaces, epd=5.0, fields_deg=[0.0, 15.0, 30.0], wavelengths_um=wl,
@@ -109,16 +110,29 @@ def main(out="docs/figures"):
 
     bridge = ConvolutionImaging(grid_size=25, pixel_pitch_mm=0.0113,
                                 sigma_bins=2.0, noise_std_frac=0.002, seed=1)
-    f = viz.plot_psf(optics, bridge, title="Differentiable geometric PSF (KDE)")
-    f.savefig(P("fig_psf.png"), dpi=200, bbox_inches="tight")
 
     # ---- optimize + before/after + convergence + evolution ---------------
     rec = viz.OptimizationRecorder(optics)
     lm = optimize_tra(optics, 40, callback=rec)
     theta_opt = lm.theta.clone()
 
+    # `optimize_tra` traces functionally through `spot_from_theta`, so the
+    # solution lives in `lm.theta` and the optics object still holds theta_start.
+    # It must be written back explicitly or every downstream figure silently
+    # renders the STARTING design.
+    optics.set_theta(theta_opt)
+
+    # The PSF is rendered for the CONVERGED design: that is what the pipeline
+    # convolves with, and it is the only design whose ~20 um spot fits the
+    # 25x25 @ 11.3 um grid. The starting design's spot radius is ~1.5 mm, so the
+    # same grid would clip 99% of its rays (plot_psf now labels the clipping).
+    f = viz.plot_psf(optics, bridge, title="Differentiable geometric PSF (KDE)")
+    f.savefig(P("fig_psf.png"), dpi=200, bbox_inches="tight")
+
+    # view_um=None -> each spot panel autoscales to its own data. A shared box
+    # cannot show a 420 um starting spot and a 20 um converged one at once.
     f = viz.compare_designs(optics, theta_start, theta_opt,
-                           labels=("start", "optimized"), view_um=80)
+                           labels=("start", "optimized"), view_um=None)
     f.savefig(P("fig_viz_compare.png"), dpi=200, bbox_inches="tight")
 
     f = viz.plot_convergence(lm.history, title="Conventional TRA-LM optics design")

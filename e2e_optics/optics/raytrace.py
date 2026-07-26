@@ -340,7 +340,7 @@ class RotationallySymmetricOptics(BaseOptics):
         reused to derive element apertures and geometric constraints:
 
           ``r``   (S, F, W, P)   radial height |(x,y)| at each surface
-          ``tz``  (S, F, W, P)   axial marching distance into each spacing
+          ``tz``  (S+1,F,W,P)   axial marching distance into each spacing
           ``ci``  (S, F, W, P)   cos^2 of the angle of incidence
           ``cr``  (S, F, W, P)   cos^2 of the angle of refraction
           ``sn``  (S, F, W, P)   cos^2 of the surface-normal-to-axis angle
@@ -425,7 +425,10 @@ class RotationallySymmetricOptics(BaseOptics):
                 # zeta_R < 0 is exactly the total-internal-reflection signal;
                 # both are smooth in theta, unlike the boolean masks.
                 ci2 = ((d * nrm).sum(-1)) ** 2
-                sin2_t = (mu_w.squeeze(-1) ** 2) * (1.0 - ci2)
+                # mu_w is (1,W,1) and ci2 is (F,W,P): broadcast them directly.
+                # Squeezing the trailing axis first gives (1,W), which aligns W
+                # against P -- silently fine when W == 1, an error otherwise.
+                sin2_t = (mu_w ** 2) * (1.0 - ci2)
                 pr_ci.append(ci2)
                 pr_cr.append(1.0 - sin2_t)
                 # zeta_SN = cos^2 of the angle between the surface normal and the
@@ -621,6 +624,14 @@ class RotationallySymmetricOptics(BaseOptics):
              row-by-row puts every bend exactly on the drawn surface curve.
         ys : (n_fan, S+2) tensor -- y of each ray at those same nodes.
 
+        A ray that misses an element -- the conic does not extend to its radius,
+        or it would have to march backwards to reach the surface -- is truncated:
+        its remaining vertices are NaN, so the polyline simply stops instead of
+        continuing to a fictitious intersection. This mirrors the validity mask
+        the main tracer applies (see ``_trace_packed``); without it Newton
+        converges to the far branch of the surface and the layout draws a ray
+        doubling back from beyond the sensor.
+
         Purely for visualization (detached); does not touch the autodiff path.
         """
         with torch.no_grad():
@@ -641,6 +652,8 @@ class RotationallySymmetricOptics(BaseOptics):
 
             nodes_z = [torch.zeros(n_fan, dtype=dtype)]   # pupil plane, per ray
             nodes_y = [pos[:, 1].clone()]
+            alive = torch.ones(n_fan, dtype=torch.bool)
+            nan = torch.full((n_fan,), float("nan"), dtype=dtype)
 
             n_before = torch.ones(1, dtype=dtype)
             for si in range(S):
@@ -658,21 +671,29 @@ class RotationallySymmetricOptics(BaseOptics):
                     t = t - f / fp
                 x = x0 + t * dx; y = y0 + t * dy; z = z0 + t * dz
                 pos = torch.stack([x, y, z], -1)
-                nodes_z.append(z.clone())        # per-ray true intersection z
-                nodes_y.append(y.clone())
+                # Reachability: the sag square-root argument. Negative means the
+                # conic does not extend to this radius -- the ray misses the
+                # element (same test as _trace_packed's pr_reach probe).
+                reach = 1.0 - (1.0 + k) * c * c * (x * x + y * y)
+                alive = (alive & torch.isfinite(z) & torch.isfinite(y)
+                         & (reach > 0.0) & (t > -1e-9))
+                nodes_z.append(torch.where(alive, z, nan))
+                nodes_y.append(torch.where(alive, y, nan))
                 uu = x * x + y * y
                 dsag = asphere_dsag_du(uu, c, k, a)
                 nrm = torch.stack([-2.0 * x * dsag, -2.0 * y * dsag,
                                    torch.ones_like(x)], -1)
                 nrm = nrm / nrm.norm(dim=-1, keepdim=True).clamp_min(1e-12)
                 mu = (n_before / self.n_after_w[si, wi]).reshape(1)
-                d, _ = refract(d, nrm, mu)
+                d, ok = refract(d, nrm, mu)
+                alive = alive & ok            # total internal reflection stops the ray
                 n_before = self.n_after_w[si, wi].reshape(1)
             # march to image plane
             t = (z_img - pos[:, 2]) / d[:, 2]
             y_img = pos[:, 1] + t * d[:, 1]
-            nodes_z.append(z_img.expand(n_fan).clone())
-            nodes_y.append(y_img)
+            alive = alive & torch.isfinite(y_img) & (t > -1e-9)
+            nodes_z.append(torch.where(alive, z_img.expand(n_fan), nan))
+            nodes_y.append(torch.where(alive, y_img, nan))
 
             zs = torch.stack(nodes_z, dim=1)                         # (n_fan, S+2)
             ys = torch.stack(nodes_y, dim=1)                         # (n_fan, S+2)

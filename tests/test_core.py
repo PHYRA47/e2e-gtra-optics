@@ -20,6 +20,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 
 import math
 import torch
+import numpy as _np
 import torch.func as tf
 
 from e2e_optics.optics.raytrace import RotationallySymmetricOptics, Surface
@@ -398,6 +399,101 @@ def test_constraints_rescue_a_violating_design():
     assert (tz_free != tz_free) or abs(tz_free - 0.25) > abs(tz_con - 0.25)
 
 
+def test_probe_shapes_are_correct_with_multiple_wavelengths():
+    """Regression: the zeta_R probe broadcast mu_w (1,W,1) against ci2 (F,W,P).
+
+    Squeezing mu_w's trailing axis gave (1,W), which aligns W against P -- silent
+    when W == 1 (every monochromatic test), a hard error for W > 1. Chromatic
+    probes therefore need their OWN shape assertion.
+    """
+    optics = RotationallySymmetricOptics(
+        [Surface(1 / 5.0, 0.0, [0.0, 0.0, 0.0], 2.2, 1.5168, True, abbe=64.17),
+         Surface(-1 / 18.0, 0.0, [0.0, 0.0, 0.0], 2.0, 1.0, False)],
+        epd=4.0, fields_deg=[0.0, 12.0, 24.0],
+        wavelengths_um=[0.4861, 0.5876, 0.6563],       # F, d, C lines
+        n_pupil_rings=4, dispersion=True, dtype=torch.float64)
+    F = optics.fields_deg.numel(); W = optics.wavelengths_um.numel()
+    P = optics.pupil.shape[0]; S = optics.n_surfaces
+    pk = optics.ray_probes()
+    for key in ("r", "ci", "cr", "sn", "reach"):
+        assert pk[key].shape == (S, F, W, P), \
+            f"probe {key!r} has shape {tuple(pk[key].shape)}, expected {(S, F, W, P)}"
+    # tz carries S+1 axial spacings: one ending at each surface, plus the final
+    # march to the image plane (the back focal distance the image-distance
+    # constraint bounds).
+    assert pk["tz"].shape == (S + 1, F, W, P), tuple(pk["tz"].shape)
+    # cos^2 quantities must stay in [0,1] where the ray is physical
+    assert float(pk["ci"].max()) <= 1.0 + 1e-9
+    assert float(pk["sn"].max()) <= 1.0 + 1e-9
+
+
+def test_kde_deposit_conserves_interior_energy_for_any_sigma():
+    """Interior rays deposit exactly unit energy; the normalizer is exact.
+
+    For integer sigma the full-support sum equals sigma identically, but for
+    sigma=2.5 it oscillates between 2.4 and 2.6 with sub-bin phase -- so the
+    normalizer must be computed, not assumed constant.
+    """
+    from e2e_optics.bridge.kde_psf import _triangular_deposit
+    coord = torch.tensor([[5.0, 5.5, 12.3, 18.7]], dtype=torch.float64)
+    for sigma in (1.0, 2.0, 2.5, 3.0):
+        w = _triangular_deposit(coord, 25, sigma)
+        assert torch.allclose(w.sum(-1), torch.ones_like(w.sum(-1)), atol=1e-12), \
+            f"sigma={sigma}: interior energy {w.sum(-1)}"
+
+
+def test_offgrid_rays_leave_the_grid_instead_of_piling_on_the_border():
+    """Regression: normalizing by the ON-GRID sum dumped off-grid rays on the edge.
+
+    A ray 1.5 bins outside the frame used to keep its full unit energy, deposited
+    entirely into the border bin. On the toy's starting design that put 25-67% of
+    the PSF energy in a one-bin frame -- an artifact resembling diffraction rings.
+    """
+    from e2e_optics.bridge.kde_psf import _triangular_deposit
+    coord = torch.tensor([[-1.5, 26.5]], dtype=torch.float64)   # both outside G=25
+    w = _triangular_deposit(coord, 25, 2.0)
+    assert float(w[0, 0].sum()) < 0.3, "ray outside the grid kept too much energy"
+    assert float(w[0, 1].sum()) == 0.0, "ray far outside must deposit nothing"
+
+
+def test_offgrid_fraction_flags_an_undersized_psf_grid():
+    """The PSF is renormalized, so a too-small grid looks fine -- report clipping."""
+    from e2e_optics.bridge.kde_psf import offgrid_fraction
+    optics = _toy_derived(rings=6, fields=(0.0, 15.0, 30.0))
+    sp = optics.forward()
+    tight = offgrid_fraction(sp, 25, 0.0113)        # half-width 136 um
+    roomy = offgrid_fraction(sp, 25, 0.400)         # half-width 4.8 mm
+    # every field clips heavily (0.47-0.91 on this toy); the point is that the
+    # number is large and reported, not its exact value
+    assert float(tight.min()) > 0.25, f"undersized grid not flagged: {tight}"
+    assert float(tight.max()) > 0.8, f"worst field under-reported: {tight}"
+    assert float(roomy.max()) == 0.0, f"generous grid reports clipping: {roomy}"
+
+
+def test_bridge_warns_when_psf_grid_clips_the_spot():
+    """A clipped PSF still looks plausible, so every downstream PSNR is wrong.
+
+    The bridge must say so rather than silently convolve with a truncated spot.
+    """
+    import warnings
+    from e2e_optics.bridge.imaging import ConvolutionImaging
+    optics = _toy_derived(rings=6, fields=(0.0, 15.0, 30.0))
+    sp = optics.forward()
+
+    tight = ConvolutionImaging(grid_size=25, pixel_pitch_mm=0.0113, sigma_bins=2.0, seed=1)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        tight.psf(sp); tight.psf(sp)
+        assert len(w) == 1, f"expected exactly one warning, got {len(w)}"
+        assert "clips" in str(w[0].message)
+
+    roomy = ConvolutionImaging(grid_size=25, pixel_pitch_mm=0.400, sigma_bins=2.0, seed=1)
+    with warnings.catch_warnings(record=True) as w2:
+        warnings.simplefilter("always")
+        roomy.psf(sp)
+        assert len(w2) == 0, f"generous grid warned: {[str(x.message) for x in w2]}"
+
+
 # ---------------------------------------------------------------------------
 # Element-agnostic naming
 # ---------------------------------------------------------------------------
@@ -487,6 +583,60 @@ def test_field_convergence_curve_covers_every_field():
     # one line per field plus the design-wide ESR curve
     assert len(ax.lines) >= optics.fields_deg.numel() + 1
     assert ax.get_yscale() == "log"
+    _V.plt.close(fig)
+
+
+def test_layout_fan_never_exceeds_the_entrance_pupil():
+    """The drawn fan must not carry light the stop would block.
+
+    Semi-apertures are derived from the ray footprint, and the derived minimum
+    can exceed epd/2 (on this toy 3.30 mm vs a 2.50 mm pupil radius). Launching
+    the fan at the element radius draws rays the system never collects; at wide
+    field those miss the rear element entirely and leave at absurd angles.
+    """
+    from e2e_optics import viz as _V
+    optics = _toy_derived(rings=4, fields=(0.0, 30.0))
+    rp = _V._limiting_radius(optics)
+    cap = 0.5 * float(optics.epd)
+    assert rp <= cap + 1e-9, f"fan radius {rp:.3f} mm exceeds pupil radius {cap:.3f} mm"
+
+
+def test_ray_paths_truncate_instead_of_inventing_intersections():
+    """A ray that misses an element stops; it must not bend back from beyond
+    the sensor (Newton converging on the far branch of the conic)."""
+    import torch as _t
+    optics = _toy_derived(rings=4, fields=(0.0, 30.0))
+    z_img = float(_t.cumsum(optics.thick, 0)[-1])
+    for fi in range(optics.fields_deg.numel()):
+        zs, ys = optics.ray_paths(field_index=fi, n_fan=9)
+        z = zs.numpy()
+        finite = ~_np.isnan(z)
+        assert (z[finite] <= z_img + 1e-6).all(), \
+            f"field {fi}: a ray vertex sits beyond the image plane at z={z[finite].max():.2f}"
+        # surviving vertices march forward
+        for r in range(z.shape[0]):
+            row = z[r][~_np.isnan(z[r])]
+            assert (_np.diff(row) >= -1e-6).all(), f"field {fi} ray {r} marches backwards"
+
+
+def test_layout_view_clamp_honours_its_annotation():
+    """When the clamp fires, the y-limits it reports must be the ones drawn.
+
+    With aspect 'datalim' matplotlib silently discards fixed y-limits to satisfy
+    the equal aspect, so the annotation would state a half-width the panel does
+    not show. Drive the helper directly: the toys no longer produce escaping
+    rays (the fan is pupil-capped), so this guard needs a synthetic case.
+    """
+    from e2e_optics import viz as _V
+    fig, ax = _V.plt.subplots()
+    ax.plot([0.0, 10.0], [0.0, 60.0])          # a ray leaving the frame
+    ax.set_aspect("equal", adjustable="datalim")
+    fired = _V._clamp_layout_view(ax, R_out=3.0, st=_V._S(None))
+    assert fired, "clamp did not fire on a 60 mm excursion"
+    fig.canvas.draw()                          # limits must survive the draw
+    lo, hi = ax.get_ylim()
+    assert abs(max(abs(lo), abs(hi)) - 3.0 * 1.6) < 1e-6, \
+        f"clamped ylim {(lo, hi)} does not match the annotated half-width"
     _V.plt.close(fig)
 
 

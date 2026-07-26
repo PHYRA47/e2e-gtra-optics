@@ -126,9 +126,20 @@ Representative output (CPU, ~2 min):
 pytest -q          # or: python tests/test_core.py
 ```
 
-Seven checks: forward/backward-AD agreement on the tracer (~1e-10), KDE PSF energy
-conservation, GTRA→TRA reduction, GTRA-gradient = task-gradient, LM convergence,
-and toy-lens spot shrinkage under LM.
+34 checks, all self-contained (no network access, ~3 min on CPU). The ones worth
+knowing about:
+
+* forward- vs backward-mode AD agreement on the tracer (~1e-10) — the AD split is
+  the crux of the method, so it is pinned numerically
+* KDE PSF energy conservation, and that rays landing off-grid *lose* their energy
+  instead of piling it onto the border bin
+* the bridge warns (once) when the PSF grid is too small for the spot it is asked
+  to render, rather than silently clipping
+* GTRA → TRA reduction verified element-wise, not just in norm
+* GTRA gradient equals the true task gradient
+* LM monotone convergence and toy-optics spot shrinkage
+* each constraint block is exactly zero when satisfied and positive when violated,
+  and the spacing labels line up with the probe `tz` offset
 
 ---
 
@@ -138,10 +149,20 @@ The code base is organized as the four stages you reason about: **optics →
 bridge → optimizer → algorithm**.
 
 ### 1. Optics — `e2e_optics.optics`
-`RotationallySymmetricLens(BaseOptics)`: a differentiable sequential ray tracer.
+`RotationallySymmetricOptics(BaseOptics)`: a differentiable sequential ray tracer.
 Even-asphere surfaces, vector Snell refraction, Newton ray–surface intersection,
 concentric-ring pupil sampling. Produces a `SpotDiagram`. The pure function
 `spot_from_theta(θ)` is what LM differentiates with forward-mode AD.
+
+The naming is **element-agnostic** on purpose: nothing in the tracer assumes a
+refractive lens, so a diffractive element or metasurface added later fits the same
+`BaseOptics` interface without renaming the API around it.
+
+`ray_probes()` returns the per-surface geometric quantities the constraint
+residuals need (incidence/refraction cosines, surface normals, axial marching
+distances, and how far each ray reaches radially). Element semi-apertures are
+**derived from the traced ray footprint** rather than hand-typed, so a layout plot
+always draws the aperture the rays actually use — see `docs/semi_apertures.md`.
 
 ### 2. Bridge — `e2e_optics.bridge` (the "middle part")
 * `gtra.py` — the GTRA lift (`gtra_residuals`, `tra_residuals`). **This is the
@@ -164,9 +185,18 @@ concentric-ring pupil sampling. Produces a `SpotDiagram`. The pure function
   damping, and step rejection (monotone convergence). Jacobian via `jacfwd`.
   `run(n, callback=...)` calls `callback(state)` after each accepted step — the
   hook the visualization recorder uses.
-* `JointOptimizer` — the alternating loop: a GTRA-LM lens step (network frozen)
-  then an Adam network step (lens frozen). **Read this file first** to see how the
+* `JointOptimizer` — the alternating loop: a GTRA-LM optics step (network frozen)
+  then an Adam network step (optics frozen). **Read this file first** to see how the
   four parts connect and where the AD split happens.
+* `constraints.py` — the paper's soft manufacturability residuals (Supp. S2.2.2):
+  ray-path (`l_RP`), ray-angle (`l_RA`) and surface-normal (`l_SN`) blocks, each a
+  one-sided `ramp` that is exactly zero inside the feasible region so a satisfied
+  constraint contributes no gradient. `geometric_residuals(probes, ...)` returns
+  them concatenated, ready to `torch.cat` onto the image-quality residual before
+  LM sees it. `spacing_kinds_from_optics(optics)` labels each axial spacing
+  glass/air/image so Table S8 bounds apply to the right gap — the probe `tz` array
+  has one *more* entry than there are surfaces (it starts at the entrance pupil),
+  and getting that offset wrong silently bounds an air gap with a glass minimum.
 
 ### Visualization — `e2e_optics.viz`
 Reusable diagnostics so the plots are part of the code base, not throwaway
@@ -184,7 +214,7 @@ Layout plots draw each refractive element as a **closed, filled glass body**
 the meridional ray fans are launched across the **limiting clear aperture** so
 they stay inside the glass. Glass elements are detected automatically from the
 per-surface `n_after` (a gap with index > 1 is glass); rays come from
-`RotationallySymmetricLens.ray_paths(..., pupil_radius=...)`.
+`RotationallySymmetricOptics.ray_paths(..., pupil_radius=...)`.
 
 **Consistent, customizable colour scheme.** Every figure shares one `VizStyle`,
 covering the four groups you can control — **surfaces**, **field lines**,

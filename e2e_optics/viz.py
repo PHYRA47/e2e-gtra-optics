@@ -212,13 +212,29 @@ def _draw_elements(ax, optics, st: VizStyle):
 
 
 def _limiting_radius(optics) -> float:
-    """Half-height for the layout ray fan: the aperture-stop clear radius if a
-    stop is flagged, else the smallest clear semi-aperture (so the fan stays
-    inside every element)."""
+    """Half-height for the layout ray fan, in mm.
+
+    The fan must never be wider than the light the system actually collects, so
+    the entrance-pupil radius (epd/2) is a hard cap. Within that, use the
+    aperture-stop clear radius if a stop is flagged, else the smallest clear
+    semi-aperture so the fan stays inside every element.
+
+    The cap matters now that semi-apertures are DERIVED from the ray footprint
+    (docs/semi_apertures.md): the derived minimum can exceed epd/2 -- on the toy
+    it is 3.30 mm against a 2.50 mm pupil radius -- and launching the fan there
+    draws rays the stop would have blocked. Those rays miss the rear element at
+    wide field and shoot off at absurd angles, which is what put a 69 mm ray in
+    the layout figure.
+    """
+    cap = 0.5 * float(optics.epd)
+    r = cap
     for si, is_stop in enumerate(optics.is_stop):
         if is_stop:
-            return float(optics.semi_aperture[si])
-    return min(float(s) for s in optics.semi_aperture)
+            r = float(optics.semi_aperture[si])
+            break
+    else:
+        r = min(float(s) for s in optics.semi_aperture)
+    return min(r, cap)
 
 
 def _entrance_pupil_z(optics) -> float:
@@ -379,10 +395,43 @@ def _focus_inset(ax, optics, st, field_index, rays, n_fan):
     return axin
 
 
+def _clamp_layout_view(ax, R_out, st, keep_factor: float = 1.6):
+    """Clamp a cross-section's y-view to the element extent, annotating clipping.
+
+    A badly-corrected design can send an off-axis ray far off the axis. Those
+    are real traced rays, but autoscaling to them shrinks the glass to a few
+    pixels and the figure stops showing the optics. Keep the glass plus a
+    margin, and state in the axes how far the rays actually go so the clipping
+    is never mistaken for the true ray extent.
+
+    This is a guard, not a routine path: with the fan capped at the entrance
+    pupil (``_limiting_radius``) and missed elements truncated by
+    ``ray_paths``, neither toy triggers it. It fired constantly before those
+    two fixes, on rays that were themselves artefacts.
+    """
+    y_lo, y_hi = ax.get_ylim()
+    reach = max(abs(y_lo), abs(y_hi))
+    keep = float(R_out) * keep_factor
+    if reach <= keep:
+        return False
+    # 'datalim' (set by _draw_cross_section) lets matplotlib silently discard
+    # these limits to satisfy the equal aspect -- the annotation would then
+    # print a half-width the panel does not actually show. 'box' honours the
+    # limits and reshapes the axes instead.
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_ylim(-keep, keep)
+    ax.text(0.99, 0.02,
+            f"view clipped to \u00b1{keep:.1f} mm; rays reach \u00b1{reach:.0f} mm",
+            transform=ax.transAxes, ha='right', va='bottom',
+            fontsize=st.tick_size - 1, color="0.45", fontfamily=st.font_family)
+    return True
+
+
 def plot_layout(optics, field_index: Optional[int] = None,
                      rays: str = "chief_marginal", n_fan: int = 9,
                      chromatic: bool = False, title: str = "Optical layout",
                      focus_inset: Optional[bool] = None,
+                     y_view: str = "elements",
                      style: Optional[VizStyle] = None):
     """Cross-section drawing: closed glass elements + traced rays.
 
@@ -394,6 +443,11 @@ def plot_layout(optics, field_index: Optional[int] = None,
     marginal rays per field; ``rays="fan"`` draws a denser ``n_fan`` fan. Rays
     launch from the entrance pupil across the limiting clear aperture, so they
     stay inside the glass and each bend sits on the true surface curve.
+
+    ``y_view="elements"`` (default) clamps the vertical view to the glass extent
+    so a wildly-diverging ray in an uncorrected design cannot squash the elements
+    out of visibility; the clipping is annotated in the axes. Pass
+    ``y_view="rays"`` to autoscale to every traced ray instead.
 
     ``chromatic=True`` traces every wavelength and colours rays by wavelength
     (paper convention, blue->green->red); otherwise the d-line is traced and
@@ -411,6 +465,9 @@ def plot_layout(optics, field_index: Optional[int] = None,
     ax.set_xlabel("z  (mm)"); ax.set_ylabel("y  (mm)")
     ax.set_title(title)
     ax.grid(True, color=st.grid_color, alpha=st.grid_alpha, zorder=0)
+
+    if y_view == "elements":
+        _clamp_layout_view(ax, R_out, st)
     multi_field = (field_index is None and optics.fields_deg.numel() > 1)
     if multi_field or (chromatic and optics.wavelengths_um.numel() > 1):
         _layout_legend(ax, optics, st, chromatic)
@@ -467,11 +524,15 @@ def plot_psf(optics, bridge, title: str = "Geometric PSF (KDE)",
     PSF of *every* field, reusing the bridge's grid/pitch/sigma so what you see
     matches what the pipeline convolves with.
     """
-    from .bridge.kde_psf import kde_psf
+    from .bridge.kde_psf import kde_psf, offgrid_fraction
     st = _S(style)
     sp = optics.forward()
     psf = kde_psf(sp, bridge.grid_size, bridge.pixel_pitch_mm,
                   bridge.sigma_bins, per_field=True)   # (F,W,G,G)
+    # A too-small grid still returns a normalized, plausible-looking PSF -- it is
+    # the CLIPPED spot. Report the clipping rather than hide it.
+    off = offgrid_fraction(sp, bridge.grid_size, bridge.pixel_pitch_mm)
+    half_um = (bridge.grid_size - 1) / 2.0 * bridge.pixel_pitch_mm * 1000.0
     F = psf.shape[0]
     fig, axs = _fig(1, F, w=2.4, h=2.6, style=st)
     if F == 1:
@@ -480,9 +541,16 @@ def plot_psf(optics, bridge, title: str = "Geometric PSF (KDE)",
         ax = axs[fi]
         p = psf[fi, 0].detach().numpy()
         ax.imshow(p, cmap=cmap)
-        ax.set_title(_field_labels(optics)[fi])
+        fo = float(off[fi]) * 100.0
+        ax.set_title(_field_labels(optics)[fi] +
+                     (f"  ({fo:.0f}% clipped)" if fo > 1.0 else ""),
+                     color="#b2182b" if fo > 5.0 else st.font_color)
         ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle(title, fontsize=st.title_size, color=st.font_color,
+    fig.suptitle(f"{title}\n"
+                 f"grid {bridge.grid_size}\u00d7{bridge.grid_size} @ "
+                 f"{bridge.pixel_pitch_mm*1000:.1f} \u00b5m/bin "
+                 f"(\u00b1{half_um:.0f} \u00b5m)",
+                 fontsize=st.title_size, color=st.font_color,
                  fontfamily=st.font_family)
     fig.tight_layout()
     return fig
@@ -528,8 +596,12 @@ def compare_designs(optics, theta_before, theta_after,
         optics.set_theta(th)
         # --- layout (top row) ---
         axL = axs[0, col]
-        _draw_cross_section(axL, optics, st, rays=rays, n_fan=n_fan,
-                            chromatic=chromatic)
+        _, R_out = _draw_cross_section(axL, optics, st, rays=rays, n_fan=n_fan,
+                                       chromatic=chromatic)
+        # Without this the starting design's diverging 30-deg ray sets the scale
+        # and both elements collapse to a few pixels -- the panel would show the
+        # ray excursion instead of the optics being compared.
+        _clamp_layout_view(axL, R_out, st)
         axL.set_title(f"{lab} \u2014 layout")
         axL.set_xlabel("z (mm)"); axL.set_ylabel("y (mm)")
         # --- worst-field spot (bottom row) ---
@@ -541,11 +613,25 @@ def compare_designs(optics, theta_before, theta_after,
         axS.scatter(pts[:, 0], pts[:, 1], s=4,
                     color=st.color(fi), alpha=0.6, edgecolors='none')
         axS.set_aspect('equal')
+        # The panel draws the WORST field, so it must be labelled with that
+        # field's own RMS. ESR is the mean over fields, so it necessarily sits
+        # below the worst field's RMS -- printing it here would understate the
+        # spot the reader is looking at (by ~1.6x on the starting toy).
         esr = float(sp.effective_spot_radius()) * 1000
-        axS.set_title(f"{lab} \u2014 spot @ {_field_labels(optics)[fi]}  (ESR {esr:.1f} \u00b5m)")
+        rms_fi = float(rms[fi]) * 1000
+        axS.set_title(f"{lab} \u2014 worst field {_field_labels(optics)[fi]}"
+                      f"  (RMS {rms_fi:.1f} \u00b5m)\n"
+                      f"design-wide ESR {esr:.1f} \u00b5m (mean over fields)",
+                      fontsize=st.title_size - 2)
         axS.set_xlabel("x (\u00b5m)"); axS.set_ylabel("y (\u00b5m)")
-        if view_um:
-            axS.set_xlim(-view_um, view_um); axS.set_ylim(-view_um, view_um)
+        # Default autoscales per panel and PRINTS the box half-width, because a
+        # shared box cannot show a 420 um starting spot and a 20 um converged one
+        # at once. Pass view_um for a genuinely shared box.
+        v = view_um if view_um else float(np.abs(pts).max()) * 1.15
+        axS.set_xlim(-v, v); axS.set_ylim(-v, v)
+        axS.text(0.96, 0.035, f"\u00b1{v:.0f} \u00b5m", transform=axS.transAxes,
+                 ha="right", va="bottom", fontsize=st.label_size - 2,
+                 color="0.45", fontfamily=st.font_family)
     optics.set_theta(theta_saved)
     fig.tight_layout()
     return fig

@@ -13,11 +13,13 @@ Extension hooks (documented, not implemented in v1):
 """
 from __future__ import annotations
 from typing import Optional
+import warnings
+
 import torch
 import torch.nn.functional as F
 
 from .base import BaseBridge
-from .kde_psf import kde_psf
+from .kde_psf import kde_psf, offgrid_fraction
 from ..optics.base import SpotDiagram
 
 
@@ -43,6 +45,9 @@ class ConvolutionImaging(BaseBridge):
         self.sigma_bins = float(sigma_bins)
         self.noise_std_frac = float(noise_std_frac)
         self.field_index = int(field_index)
+        # fraction of clipped rays above which psf() warns (once per instance)
+        self.clip_warn_frac = 0.02
+        self._warn_clipping = True
         self.wavelength_index = int(wavelength_index)
         self._gen = None
         if seed is not None:
@@ -50,9 +55,31 @@ class ConvolutionImaging(BaseBridge):
 
     # --- BaseBridge -------------------------------------------------------
     def psf(self, spot: SpotDiagram) -> torch.Tensor:
-        """Return one (1, G, G) shift-invariant PSF (single channel v1)."""
+        """Return one (1, G, G) shift-invariant PSF (single channel v1).
+
+        Warns once if the grid is too small for the spot. The KDE renormalizes
+        each PSF to unit energy, so an undersized grid returns a plausible-looking
+        kernel that is really the *clipped* spot -- and every PSNR downstream is
+        then measured against a blur that the optics does not produce. Grids are
+        usually sized for a converged design; pointing this bridge at a starting
+        design is exactly when it bites.
+        """
         p = kde_psf(spot, self.grid_size, self.pixel_pitch_mm,
                     self.sigma_bins, per_field=True)          # (F,W,G,G)
+        if self._warn_clipping:
+            off = float(offgrid_fraction(spot, self.grid_size,
+                                         self.pixel_pitch_mm)[self.field_index])
+            if off > self.clip_warn_frac:
+                self._warn_clipping = False                   # once per instance
+                half_um = (self.grid_size - 1) / 2 * self.pixel_pitch_mm * 1000
+                warnings.warn(
+                    f"PSF grid clips {off*100:.0f}% of the rays at field "
+                    f"{self.field_index}: grid is {self.grid_size}x{self.grid_size} "
+                    f"@ {self.pixel_pitch_mm*1000:.1f} um/bin (half-width "
+                    f"{half_um:.0f} um). The PSF is renormalized, so it will look "
+                    f"reasonable but is the clipped spot. Increase grid_size or "
+                    f"pixel_pitch_mm, or evaluate a converged design.",
+                    RuntimeWarning, stacklevel=2)
         k = p[self.field_index, self.wavelength_index]        # (G,G)
         return k.unsqueeze(0)                                 # (1,G,G)
 

@@ -18,6 +18,8 @@ stub ``airy_field`` -- v1 uses the geometric PSF only.
 """
 from __future__ import annotations
 from typing import Optional
+import math
+
 import torch
 
 from ..optics.base import SpotDiagram
@@ -28,17 +30,42 @@ def _triangular_deposit(coord_bins: torch.Tensor, n_bins: int,
     """1-D separable triangular splat weights.
 
     coord_bins : (...,) ray positions in *bin units* (0 = grid center bin edge).
-    Returns weights (..., n_bins) that sum to ~1 along the last axis.
+    Returns weights (..., n_bins) summing to 1 for a ray whose kernel support
+    lies wholly INSIDE the grid, and to the on-grid *fraction* otherwise.
 
-    A triangular kernel of half-width ``sigma`` centered at each ray; evaluated
-    at integer bin centers and renormalized so the touched weights sum to 1
-    (guarantees energy conservation per ray).
+    A triangular kernel of half-width ``sigma`` centered at each ray, evaluated
+    at integer bin centers. The normalizer is the sum over the kernel's FULL
+    support -- i.e. what the weights would sum to on an unbounded grid -- not the
+    sum over the bins that happen to be on-grid.
+
+    That distinction is the whole point. Normalizing by the on-grid sum forces
+    every ray to deposit unit energy even when it lands outside the frame, so a
+    ray 1-2 bins past the edge dumps its full energy into the border bin. On the
+    starting design of the toy (98-99% of rays off a 25x25 / 11.3 um grid) that
+    put 25-67% of the "PSF" energy in a one-bin frame around the border -- a pure
+    artifact that looked like diffraction rings. Normalizing by the full-support
+    sum instead lets off-grid energy genuinely leave the grid; ``kde_psf`` then
+    renormalizes the whole PSF to unit energy, spreading the deficit over the
+    real PSF shape rather than the frame (Supp. S1.4 note).
+
+    Energy per ray is still exactly conserved for any ray whose support is
+    interior, which is the property the paper's KDE relies on.
     """
     centers = torch.arange(n_bins, dtype=coord_bins.dtype, device=coord_bins.device)
     d = (coord_bins.unsqueeze(-1) - centers.reshape(*([1] * coord_bins.dim()), n_bins)).abs()
-    w = torch.clamp(1.0 - d / sigma, min=0.0)              # triangular
-    w = w / w.sum(-1, keepdim=True).clamp_min(1e-12)       # per-ray energy = 1
-    return w
+    w = torch.clamp(1.0 - d / sigma, min=0.0)              # triangular, on-grid
+
+    # full-support normalizer: same kernel summed over the integer bin centers
+    # around the ray, ignoring the grid bounds. Exact for any sigma (for integer
+    # sigma it equals sigma identically; for e.g. sigma=2.5 it oscillates 2.4-2.6,
+    # so it must be computed rather than assumed constant).
+    K = int(math.ceil(sigma))
+    frac = coord_bins - torch.floor(coord_bins)                      # in [0,1)
+    off = torch.arange(-K, K + 1, dtype=coord_bins.dtype, device=coord_bins.device)
+    dn = (frac.unsqueeze(-1) - off.reshape(*([1] * frac.dim()), off.numel())).abs()
+    norm = torch.clamp(1.0 - dn / sigma, min=0.0).sum(-1, keepdim=True)
+
+    return w / norm.clamp_min(1e-12)
 
 
 def kde_psf(spot: SpotDiagram,
@@ -102,3 +129,25 @@ def airy_field(grid_size: int, pixel_pitch_mm: float, wavelength_um: float,
         "Diffraction-compensated PSF is a v1 extension hook (Supp. S1.4.3)."
     )
 
+
+
+def offgrid_fraction(spot: SpotDiagram, grid_size: int,
+                     pixel_pitch_mm: float) -> torch.Tensor:
+    """Fraction of valid rays per field landing outside the PSF grid: (F,).
+
+    A geometric PSF is only meaningful when the grid actually contains the spot.
+    The KDE renormalizes each PSF to unit energy, so a grid that is too small
+    still returns a plausible-looking image -- it is just the *clipped* spot,
+    with the truncated energy redistributed over whatever remained on-grid.
+
+    Rule of thumb: keep this below a few percent. On the toy's STARTING design
+    (spot radius ~1.5 mm) a 25x25 grid at 11.3 um pitch (half-width 136 um)
+    clips 99% of the rays; the same grid is appropriate once the design has
+    converged to a ~20 um spot. Size the grid to the design, or report this
+    number alongside the PSF.
+    """
+    cen = spot.centroids().reshape(-1, 1, 1, 2)
+    rel = (spot.xy - cen).abs() / pixel_pitch_mm
+    off = (rel > (grid_size - 1) / 2.0).any(-1) & spot.valid          # (F,W,P)
+    n = spot.valid.sum(dim=(1, 2)).clamp_min(1)
+    return off.sum(dim=(1, 2)).to(spot.xy.dtype) / n

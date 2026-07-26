@@ -254,7 +254,7 @@ e2e_optics/
 │   ├── config.py             # one dataclass; picks optics/bridge/algorithm by name
 │   ├── optics/
 │   │   ├── base.py           # BaseOptics ABC:  forward(θ) -> SpotDiagram
-│   │   └── raytrace.py       # RotationallySymmetricLens (asphere + Snell + Hartmann)
+│   │   └── raytrace.py       # RotationallySymmetricOptics (asphere + Snell + Hartmann)
 │   ├── bridge/
 │   │   ├── base.py           # BaseBridge ABC:  simulate(spot, scene) -> I'
 │   │   ├── kde_psf.py        # differentiable KDE geometric PSF
@@ -285,7 +285,7 @@ e2e_optics/
 | **Engine** | `LevenbergMarquardt.step()` | residual fn `θ→ℓ`, current `θ` → new `θ` | operates on a flat `θ` vector |
 
 Because the contract is *only* these tensor shapes, you can:
-- **swap the optics** — replace `RotationallySymmetricLens` with a metasurface/DOE model, as long
+- **swap the optics** — replace `RotationallySymmetricOptics` with a metasurface/DOE model, as long
   as it emits a `SpotDiagram` (or, per the paper's caveat, add auxiliary residuals);
 - **swap the bridge** — replace KDE with the diffraction-compensated PSF, or replace
   shift-invariant convolution with the spatially-varying overlap-add — `gtra.py` is untouched;
